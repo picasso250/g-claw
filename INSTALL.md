@@ -4,3 +4,5 @@
 - install python
 - install node
 - install go
+npm install -g @google/gemini-cli
+npm install -g @kilocode/cli
