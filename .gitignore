@@ -1,0 +1,11 @@
+.env
+gateway/mail_state.db
+gateway/media/*
+gateway/pending/*
+gateway/processing/*
+gateway/history/*
+!gateway/media/.gitkeep
+!gateway/pending/.gitkeep
+!gateway/processing/.gitkeep
+!gateway/history/.gitkeep
+*.exe
