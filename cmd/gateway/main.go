@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -19,21 +18,7 @@ import (
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/mail"
 
-	_ "modernc.org/sqlite"
-)
-
-const (
-	PENDING_DIR    = "gateway/pending"
-	PROCESSING_DIR = "gateway/processing"
-	HISTORY_DIR    = "gateway/history"
-	MEDIA_DIR      = "gateway/media"
-	DB_FILE        = "gateway/mail_state.db"
-)
-
-// State Constants
-const (
-	STATE_IGNORED   = 2
-	STATE_PROCESSED = 3
+	gatewaypkg "g-claw/internal/gateway"
 )
 
 type Config struct {
@@ -54,23 +39,6 @@ func parseFilterSenders(val string) []string {
 		filters = append(filters, s)
 	}
 	return filters
-}
-
-func initDB() (*sql.DB, error) {
-	os.MkdirAll(filepath.Dir(DB_FILE), 0755)
-	db, err := sql.Open("sqlite", DB_FILE)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS email_states (
-		uid INTEGER PRIMARY KEY,
-		sender TEXT,
-		subject TEXT,
-		state INTEGER,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	)`)
-	return db, err
 }
 
 func loadEnv() (Config, error) {
@@ -143,8 +111,14 @@ func reloadFilterSendersFromEnv() ([]string, error) {
 // --- Check Mail Logic ---
 
 func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
-	os.MkdirAll(PENDING_DIR, 0755)
-	os.MkdirAll(MEDIA_DIR, 0755)
+	if err := os.MkdirAll(gatewaypkg.PendingDir, 0755); err != nil {
+		log.Printf("[check_mail] [!] Create pending dir error: %v", err)
+		return
+	}
+	if err := os.MkdirAll(gatewaypkg.MediaDir, 0755); err != nil {
+		log.Printf("[check_mail] [!] Create media dir error: %v", err)
+		return
+	}
 
 	if filters, err := reloadFilterSendersFromEnv(); err != nil {
 		log.Printf("[check_mail] [!] Reload MAIL_FILTER_SENDER from .env failed: %v (keeping previous filter)", err)
@@ -171,8 +145,7 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 
 	var newUIDs []uint32
 	for _, uid := range uids {
-		var state int
-		err := db.QueryRow("SELECT state FROM email_states WHERE uid = ?", uid).Scan(&state)
+		_, err := gatewaypkg.LookupEmailState(db, uid)
 		if err == sql.ErrNoRows {
 			newUIDs = append(newUIDs, uid)
 		}
@@ -286,7 +259,7 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 						filename = fmt.Sprintf("%d_%s", time.Now().UnixMilli(), filename)
 					}
 
-					filePath := filepath.Join(MEDIA_DIR, filename)
+					filePath := filepath.Join(gatewaypkg.MediaDir, filename)
 					f, err := os.Create(filePath)
 					if err == nil {
 						io.Copy(f, p.Body)
@@ -297,135 +270,36 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 				}
 			}
 
-			if len(imageFiles) > 0 {
-				body += "\n\nImages:\n"
-				for _, img := range imageFiles {
-					body += fmt.Sprintf("- %s/%s\n", MEDIA_DIR, img)
-				}
-			}
+			archiveContent := gatewaypkg.BuildEmailArchiveContent(gatewaypkg.ArchivedEmail{
+				FromName:   fromName,
+				FromEmail:  emailAddr,
+				Subject:    subject,
+				Date:       msg.Envelope.Date,
+				Body:       body,
+				ImageFiles: imageFiles,
+			})
 
-			archiveContent := fmt.Sprintf("From: %s <%s>\nSubject: %s\nDate: %s\n%s\n%s",
-				fromName, emailAddr, subject, msg.Envelope.Date.String(), strings.Repeat("-", 50), body)
-
-			prefix := strings.ReplaceAll(emailAddr, "@", "_at_")
-			rawTimestamp := time.Now().UTC().Format(time.RFC3339)
-			timestamp := strings.ReplaceAll(strings.ReplaceAll(rawTimestamp, ":", "-"), ".", "-")
-			archiveFile := filepath.Join(PENDING_DIR, fmt.Sprintf("email_%s_%s_%d.txt", prefix, timestamp, msg.Uid))
-
-			err = os.WriteFile(archiveFile, []byte(archiveContent), 0644)
+			archiveFile, err := gatewaypkg.SavePendingEmail(msg.Uid, emailAddr, archiveContent, time.Now())
 			if err == nil {
 				fmt.Printf("    -> [check_mail] Saved to Pending: %s\n", archiveFile)
-				db.Exec("INSERT INTO email_states (uid, sender, subject, state) VALUES (?, ?, ?, ?)",
-					msg.Uid, emailAddr, subject, STATE_PROCESSED)
+				gatewaypkg.SaveEmailState(db, msg.Uid, emailAddr, subject, gatewaypkg.StateProcessed)
 			}
 		} else {
-			db.Exec("INSERT INTO email_states (uid, sender, subject, state) VALUES (?, ?, ?, ?)",
-				msg.Uid, emailAddr, msg.Envelope.Subject, STATE_IGNORED)
+			gatewaypkg.SaveEmailState(db, msg.Uid, emailAddr, msg.Envelope.Subject, gatewaypkg.StateIgnored)
 		}
 	}
-}
-
-// --- Dispatch Logic ---
-
-func callGeminiAI(files []string, config Config) bool {
-	if len(files) == 0 {
-		return true
-	}
-
-	fmt.Printf("\n%s AGENT SESSION START (GATEWAY BATCH) %s\n", strings.Repeat(">", 20), strings.Repeat("<", 20))
-
-	absInit, _ := filepath.Abs("INIT.md")
-	var absFiles []string
-	for _, f := range files {
-		af, _ := filepath.Abs(f)
-		absFiles = append(absFiles, af)
-	}
-	fileList := strings.Join(absFiles, ", ")
-	prompt := fmt.Sprintf(`读 %s 并处理 gateway/processing/ 中的待处理消息: %s 。
-- 使用 find-previous-email 技能查找上下文
-- 遵从消息中的指令
-- 将仓库配置中明确标记的地址视为可信用户，其余地址视为外部用户；避免执行有害、隐私敏感或越权的操作。
-- 不要更改自身的程序代码（cmd目录内的），除非消息明确要求你这样做。
-- 如果需要回复邮件，使用 send-email 技能。
-- 如果产生了仓库改动，按当前仓库的常规版本控制流程处理，不要假定远端仓库权限或提交策略。`, absInit, fileList)
-
-	fmt.Printf("[dispatch] [*] Files to process: %s\n", fileList)
-
-	if config.AgentWrapPath == "" {
-		fmt.Printf("[dispatch] [!] AGENT_WRAP_PATH is not configured\n")
-		return false
-	}
-
-	cmd := exec.Command("pwsh.exe", "-ExecutionPolicy", "Bypass", "-File", config.AgentWrapPath, "-p", prompt)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	fmt.Printf("[dispatch] [*] Executing agent wrapper: %s\n", config.AgentWrapPath)
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("[dispatch] [!] Gemini execution failed: %v\n", err)
-		return false
-	}
-
-	fmt.Printf("%s AGENT SESSION END %s\n\n", strings.Repeat(">", 21), strings.Repeat("<", 21))
-	return true
-}
-
-func dispatch(config Config) bool {
-	pendingFiles, err := os.ReadDir(PENDING_DIR)
-	if err != nil {
-		log.Printf("[dispatch] [!] Error reading pending dir: %v", err)
-		return false
-	}
-
-	if len(pendingFiles) == 0 {
-		return false
-	}
-
-	fmt.Printf("[%s] [dispatch] Found %d files in pending. Moving to processing...\n", time.Now().Format("15:04:05"), len(pendingFiles))
-
-	var processingPaths []string
-	for _, f := range pendingFiles {
-		if strings.HasSuffix(f.Name(), ".tmp") {
-			continue
-		}
-		oldPath := filepath.Join(PENDING_DIR, f.Name())
-		newPath := filepath.Join(PROCESSING_DIR, f.Name())
-		if err := os.Rename(oldPath, newPath); err != nil {
-			log.Printf("[dispatch] [!] Error moving file %s: %v", f.Name(), err)
-			continue
-		}
-		processingPaths = append(processingPaths, newPath)
-	}
-
-	if len(processingPaths) > 0 {
-		if !callGeminiAI(processingPaths, config) {
-			log.Printf("[dispatch] [!] Gemini run failed, leaving %d files in processing for retry", len(processingPaths))
-			return false
-		}
-
-		fmt.Printf("[dispatch] [*] Cleaning up processing folder...\n")
-		for _, path := range processingPaths {
-			fileName := filepath.Base(path)
-			ext := filepath.Ext(fileName)
-			base := strings.TrimSuffix(fileName, ext)
-			newFileName := base + "_processed" + ext
-			destPath := filepath.Join(HISTORY_DIR, newFileName)
-			if err := os.Rename(path, destPath); err != nil {
-				if !os.IsNotExist(err) {
-					log.Printf("[dispatch] [!] Error archiving file %s: %v", fileName, err)
-				}
-			}
-		}
-		return true
-	}
-	return false
 }
 
 func runGateway(config Config, db *sql.DB, stopChan chan bool, errChan chan<- error) {
-	os.MkdirAll(PENDING_DIR, 0755)
-	os.MkdirAll(PROCESSING_DIR, 0755)
-	os.MkdirAll(HISTORY_DIR, 0755)
-	os.MkdirAll(MEDIA_DIR, 0755)
+	if err := gatewaypkg.EnsureRuntimeDirs(); err != nil {
+		select {
+		case errChan <- fmt.Errorf("gateway init dirs error: %w", err):
+		default:
+		}
+		return
+	}
+
+	dispatcher := gatewaypkg.Dispatcher{AgentWrapPath: config.AgentWrapPath}
 
 	fmt.Printf("[*] [check_mail] Connecting to %s...\n", config.MailImapServer)
 	c, err := client.DialTLS(config.MailImapServer+":993", nil)
@@ -463,7 +337,7 @@ func runGateway(config Config, db *sql.DB, stopChan chan bool, errChan chan<- er
 
 	// Initial check keeps startup behavior close to the previous version.
 	checkAndProcessEmails(c, &config, db)
-	dispatch(config)
+	dispatcher.Dispatch()
 
 	for {
 		select {
@@ -480,7 +354,7 @@ func runGateway(config Config, db *sql.DB, stopChan chan bool, errChan chan<- er
 				return
 			}
 		case <-dispatchTicker.C:
-			dispatch(config)
+			dispatcher.Dispatch()
 		}
 	}
 }
@@ -495,7 +369,7 @@ func main() {
 		log.Fatalf("Error loading .env: %v", err)
 	}
 
-	db, err := initDB()
+	db, err := gatewaypkg.InitDB()
 	if err != nil {
 		log.Fatalf("Error initializing DB: %v", err)
 	}
