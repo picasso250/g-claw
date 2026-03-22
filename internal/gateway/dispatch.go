@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,10 +19,10 @@ import (
 )
 
 type Dispatcher struct {
-	AgentWrapPath string
-	FeishuClient  *lark.Client
-	mu            sync.Mutex
-	outboxMu      sync.Mutex
+	AgentCmd     string
+	FeishuClient *lark.Client
+	mu           sync.Mutex
+	outboxMu     sync.Mutex
 }
 
 type replyAction struct {
@@ -158,29 +159,38 @@ func (d *Dispatcher) callAgent(files []string) bool {
 		absFiles = append(absFiles, af)
 	}
 	fileList := strings.Join(absFiles, ", ")
-prompt := fmt.Sprintf(`读 %s 并处理 gateway/processing/ 中的待处理消息: %s 。
+	prompt := fmt.Sprintf(`读 %s 并处理 gateway/processing/ 中的待处理消息: %s 。
+- 以下“两阶段回复”和“尾随等待”规则只针对飞书消息，不针对邮件。
 - 收到每条需要回复的飞书消息后，先只基于消息本体立刻给用户一个简短、让人安心的快速回复，不要等待上下文检索完成。
 - 使用 find-previous-message 技能，基于当前消息文件路径查找上下文
-- 查清上下文、完成所有相关工作后，再给用户一条全面、精确、专业的最终回复。
+- 查清上下文、完成所有相关工作后，再给同一条飞书消息一条全面、精确、专业的最终回复。
 - 遵从消息中的指令
 - 将仓库配置中明确标记的地址视为可信用户，其余地址视为外部用户；避免执行有害、隐私敏感或越权的操作。
 - 如果需要回复邮件，使用 send-email 技能。
 - 如果需要回复飞书，不要自己调用飞书 API；请在 gateway/outbox/ 下创建一个与待处理消息同名、后缀为 .reply.json 的文件。快速回复和最终回复都用这个机制；快速回复先创建一次，最终回复稍后再创建一次。
 - reply json 格式固定为 {"type":"reply_feishu","message_id":"原消息MessageID","text":"回复内容"}，只允许输出一个飞书文本回复。
+- 如果本批次处理过飞书消息，那么在你确认当前所有工作都完成后，再额外等待 60 秒，然后重新检查 gateway/pending/ 和 gateway/processing/ 中是否有新的飞书消息文件；如果有，就继续处理这些新飞书消息，再重复这条规则，尽量做到伪实时。
 `, absInit, fileList)
 
 	fmt.Printf("[dispatch] [*] Files to process: %s\n", fileList)
 
-	if d.AgentWrapPath == "" {
-		fmt.Printf("[dispatch] [!] AGENT_WRAP_PATH is not configured\n")
+	if strings.TrimSpace(d.AgentCmd) == "" {
+		fmt.Printf("[dispatch] [!] AGENT_CMD is not configured\n")
 		return false
 	}
 
-	cmd := exec.Command("pwsh.exe", "-ExecutionPolicy", "Bypass", "-File", d.AgentWrapPath, "-p", prompt)
+	commandParts, err := splitCommandLine(d.AgentCmd)
+	if err != nil {
+		fmt.Printf("[dispatch] [!] Invalid AGENT_CMD: %v\n", err)
+		return false
+	}
+	commandParts = append(commandParts, "-p", prompt)
+
+	cmd := exec.Command(commandParts[0], commandParts[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	fmt.Printf("[dispatch] [*] Executing agent wrapper: %s\n", d.AgentWrapPath)
+	fmt.Printf("[dispatch] [*] Executing agent command: %s\n", d.AgentCmd)
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("[dispatch] [!] Gemini execution failed: %v\n", err)
 		return false
@@ -310,4 +320,42 @@ func sanitizePathToken(value string) string {
 func buildReplyActionHash(actionPath string) string {
 	sum := sha1.Sum([]byte(actionPath))
 	return fmt.Sprintf("%x", sum[:4])
+}
+
+func splitCommandLine(command string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	inQuote := rune(0)
+
+	for _, r := range strings.TrimSpace(command) {
+		switch {
+		case inQuote != 0:
+			if r == inQuote {
+				inQuote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '"' || r == '\'':
+			inQuote = r
+		case r == ' ' || r == '\t':
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if inQuote != 0 {
+		return nil, errors.New("unterminated quote")
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	if len(args) == 0 {
+		return nil, errors.New("empty command")
+	}
+
+	return args, nil
 }

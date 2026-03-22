@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -28,7 +29,7 @@ type Config struct {
 	MailPass       string
 	MailImapServer string
 	FilterSenders  []string
-	AgentWrapPath  string
+	AgentCmd       string
 	Feishu         gatewaypkg.FeishuConfig
 }
 
@@ -105,10 +106,10 @@ func parseCSV(val string) []string {
 	return items
 }
 
-func findEnvFile() (string, error) {
+func findEnvFiles() ([]string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	candidates := []string{}
@@ -136,99 +137,110 @@ func findEnvFile() (string, error) {
 		}
 	}
 
+	var envFiles []string
 	for _, candidate := range candidates {
 		info, err := os.Stat(candidate)
 		if err == nil && !info.IsDir() {
-			return candidate, nil
+			envFiles = append(envFiles, candidate)
 		}
 	}
 
-	return "", fmt.Errorf(".env not found from %s upward or in home directory", wd)
+	if len(envFiles) == 0 {
+		return nil, fmt.Errorf(".env not found from %s upward or in home directory", wd)
+	}
+
+	slices.Reverse(envFiles)
+	return envFiles, nil
 }
 
-func openEnvFile() (*os.File, error) {
-	envPath, err := findEnvFile()
+func loadEnvValues() (map[string]string, error) {
+	envPaths, err := findEnvFiles()
 	if err != nil {
 		return nil, err
 	}
-	return os.Open(envPath)
+
+	values := make(map[string]string)
+	for _, envPath := range envPaths {
+		f, err := os.Open(envPath)
+		if err != nil {
+			return nil, err
+		}
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			values[key] = val
+		}
+		if err := scanner.Err(); err != nil {
+			f.Close()
+			return nil, err
+		}
+		f.Close()
+	}
+
+	return values, nil
 }
 
 func loadEnv() (Config, error) {
 	config := Config{
 		MailImapServer: "imap.163.com",
 	}
-	f, err := openEnvFile()
+	values, err := loadEnvValues()
 	if err != nil {
 		return config, err
 	}
-	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-
-		switch key {
-		case "MAIL_USER":
-			config.MailUser = val
-		case "MAIL_PASS":
-			config.MailPass = val
-		case "MAIL_IMAP_SERVER":
-			config.MailImapServer = val
-		case "MAIL_FILTER_SENDER":
-			config.FilterSenders = parseFilterSenders(val)
-		case "AGENT_WRAP_PATH":
-			config.AgentWrapPath = val
-		case "FEISHU_ENABLE":
-			config.Feishu.Enable = strings.EqualFold(val, "true") || val == "1"
-		case "FEISHU_APP_ID":
-			config.Feishu.AppID = val
-		case "FEISHU_APP_SECRET":
-			config.Feishu.AppSecret = val
-		case "FEISHU_ALLOWED_OPEN_IDS":
-			config.Feishu.AllowedOpenIDs = parseCSV(val)
-		case "FEISHU_ALLOWED_CHAT_IDS":
-			config.Feishu.AllowedChatIDs = parseCSV(val)
-		}
+	if val, ok := values["MAIL_USER"]; ok {
+		config.MailUser = val
 	}
+	if val, ok := values["MAIL_PASS"]; ok {
+		config.MailPass = val
+	}
+	if val, ok := values["MAIL_IMAP_SERVER"]; ok {
+		config.MailImapServer = val
+	}
+	if val, ok := values["MAIL_FILTER_SENDER"]; ok {
+		config.FilterSenders = parseFilterSenders(val)
+	}
+	if val, ok := values["AGENT_CMD"]; ok {
+		config.AgentCmd = val
+	}
+	if val, ok := values["FEISHU_ENABLE"]; ok {
+		config.Feishu.Enable = strings.EqualFold(val, "true") || val == "1"
+	}
+	if val, ok := values["FEISHU_APP_ID"]; ok {
+		config.Feishu.AppID = val
+	}
+	if val, ok := values["FEISHU_APP_SECRET"]; ok {
+		config.Feishu.AppSecret = val
+	}
+	if val, ok := values["FEISHU_ALLOWED_OPEN_IDS"]; ok {
+		config.Feishu.AllowedOpenIDs = parseCSV(val)
+	}
+	if val, ok := values["FEISHU_ALLOWED_CHAT_IDS"]; ok {
+		config.Feishu.AllowedChatIDs = parseCSV(val)
+	}
+
 	return config, nil
 }
 
 func reloadFilterSendersFromEnv() ([]string, error) {
-	f, err := openEnvFile()
+	values, err := loadEnvValues()
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		key := strings.TrimSpace(parts[0])
-		if key != "MAIL_FILTER_SENDER" {
-			continue
-		}
-
-		val := strings.TrimSpace(parts[1])
-		return parseFilterSenders(val), nil
+	val, ok := values["MAIL_FILTER_SENDER"]
+	if !ok {
+		return []string{}, nil
 	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return []string{}, nil
+	return parseFilterSenders(val), nil
 }
 
 func signalDispatch(dispatchCh chan struct{}) {
@@ -644,8 +656,8 @@ func main() {
 	}
 
 	dispatcher := &gatewaypkg.Dispatcher{
-		AgentWrapPath: config.AgentWrapPath,
-		FeishuClient:  feishuClient,
+		AgentCmd:     config.AgentCmd,
+		FeishuClient: feishuClient,
 	}
 	if dispatcher.HasWork() {
 		signalDispatch(dispatchCh)
