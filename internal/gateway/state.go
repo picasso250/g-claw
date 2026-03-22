@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -20,29 +21,40 @@ func InitDB() (*sql.DB, error) {
 		return nil, err
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS email_states (
-		uid INTEGER PRIMARY KEY,
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS message_states (
+		source TEXT NOT NULL,
+		external_id TEXT NOT NULL,
 		sender TEXT,
 		subject TEXT,
 		state INTEGER,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (source, external_id)
 	)`)
 	return db, err
 }
 
-func LookupEmailState(db *sql.DB, uid uint32) (int, error) {
+func LookupMessageState(db *sql.DB, source, externalID string) (int, error) {
 	var state int
-	err := db.QueryRow("SELECT state FROM email_states WHERE uid = ?", uid).Scan(&state)
+	err := db.QueryRow("SELECT state FROM message_states WHERE source = ? AND external_id = ?", source, externalID).Scan(&state)
 	return state, err
 }
 
-func SaveEmailState(db *sql.DB, uid uint32, sender, subject string, state int) error {
+func SaveMessageState(db *sql.DB, source, externalID, sender, subject string, state int) error {
 	_, err := db.Exec(
-		"INSERT INTO email_states (uid, sender, subject, state) VALUES (?, ?, ?, ?)",
-		uid,
+		"INSERT INTO message_states (source, external_id, sender, subject, state) VALUES (?, ?, ?, ?, ?)",
+		source,
+		externalID,
 		sender,
 		subject,
 		state,
 	)
 	return err
+}
+
+func LookupEmailState(db *sql.DB, uid uint32) (int, error) {
+	return LookupMessageState(db, "mail", fmt.Sprintf("%d", uid))
+}
+
+func SaveEmailState(db *sql.DB, uid uint32, sender, subject string, state int) error {
+	return SaveMessageState(db, "mail", fmt.Sprintf("%d", uid), sender, subject, state)
 }

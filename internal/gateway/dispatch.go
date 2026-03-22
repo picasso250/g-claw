@@ -7,38 +7,53 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Dispatcher struct {
 	AgentWrapPath string
+	mu            sync.Mutex
 }
 
-func (d Dispatcher) Dispatch() bool {
+func (d *Dispatcher) HasWork() bool {
+	processingFiles, err := os.ReadDir(ProcessingDir)
+	if err == nil {
+		for _, f := range processingFiles {
+			if !f.IsDir() && !strings.HasSuffix(f.Name(), ".tmp") {
+				return true
+			}
+		}
+	}
+
 	pendingFiles, err := os.ReadDir(PendingDir)
+	if err == nil {
+		for _, f := range pendingFiles {
+			if !f.IsDir() && !strings.HasSuffix(f.Name(), ".tmp") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (d *Dispatcher) Dispatch() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	processingPaths, err := d.collectProcessingFiles()
 	if err != nil {
-		log.Printf("[dispatch] [!] Error reading pending dir: %v", err)
+		log.Printf("[dispatch] [!] Error reading processing dir: %v", err)
 		return false
 	}
 
-	if len(pendingFiles) == 0 {
-		return false
-	}
-
-	fmt.Printf("[%s] [dispatch] Found %d files in pending. Moving to processing...\n", time.Now().Format("15:04:05"), len(pendingFiles))
-
-	var processingPaths []string
-	for _, f := range pendingFiles {
-		if strings.HasSuffix(f.Name(), ".tmp") {
-			continue
+	if len(processingPaths) == 0 {
+		processingPaths, err = d.movePendingToProcessing()
+		if err != nil {
+			log.Printf("[dispatch] [!] Error preparing pending files: %v", err)
+			return false
 		}
-		oldPath := filepath.Join(PendingDir, f.Name())
-		newPath := filepath.Join(ProcessingDir, f.Name())
-		if err := os.Rename(oldPath, newPath); err != nil {
-			log.Printf("[dispatch] [!] Error moving file %s: %v", f.Name(), err)
-			continue
-		}
-		processingPaths = append(processingPaths, newPath)
 	}
 
 	if len(processingPaths) == 0 {
@@ -66,7 +81,56 @@ func (d Dispatcher) Dispatch() bool {
 	return true
 }
 
-func (d Dispatcher) callAgent(files []string) bool {
+func (d *Dispatcher) collectProcessingFiles() ([]string, error) {
+	files, err := os.ReadDir(ProcessingDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var processingPaths []string
+	for _, f := range files {
+		if f.IsDir() || strings.HasSuffix(f.Name(), ".tmp") {
+			continue
+		}
+		processingPaths = append(processingPaths, filepath.Join(ProcessingDir, f.Name()))
+	}
+
+	if len(processingPaths) > 0 {
+		fmt.Printf("[%s] [dispatch] Resuming %d files from processing.\n", time.Now().Format("15:04:05"), len(processingPaths))
+	}
+	return processingPaths, nil
+}
+
+func (d *Dispatcher) movePendingToProcessing() ([]string, error) {
+	pendingFiles, err := os.ReadDir(PendingDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(pendingFiles) == 0 {
+		return nil, nil
+	}
+
+	fmt.Printf("[%s] [dispatch] Found %d files in pending. Moving to processing...\n", time.Now().Format("15:04:05"), len(pendingFiles))
+
+	var processingPaths []string
+	for _, f := range pendingFiles {
+		if f.IsDir() || strings.HasSuffix(f.Name(), ".tmp") {
+			continue
+		}
+		oldPath := filepath.Join(PendingDir, f.Name())
+		newPath := filepath.Join(ProcessingDir, f.Name())
+		if err := os.Rename(oldPath, newPath); err != nil {
+			log.Printf("[dispatch] [!] Error moving file %s: %v", f.Name(), err)
+			continue
+		}
+		processingPaths = append(processingPaths, newPath)
+	}
+
+	return processingPaths, nil
+}
+
+func (d *Dispatcher) callAgent(files []string) bool {
 	if len(files) == 0 {
 		return true
 	}

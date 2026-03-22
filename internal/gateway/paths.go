@@ -5,5 +5,5 @@ const (
 	ProcessingDir = "gateway/processing"
 	HistoryDir    = "gateway/history"
 	MediaDir      = "gateway/media"
-	DBFile        = "gateway/mail_state.db"
+	DBFile        = "gateway/message_state.db"
 )

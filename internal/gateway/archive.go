@@ -9,13 +9,25 @@ import (
 )
 
 type ArchivedEmail struct {
-	FromName   string
-	FromEmail  string
-	Subject    string
-	Date       time.Time
-	Body       string
-	ImageFiles []string
+	FromName    string
+	FromEmail   string
+	Subject     string
+	Date        time.Time
+	Body        string
+	ImageFiles  []string
 	Attachments []string
+}
+
+type ArchivedMessage struct {
+	Source         string
+	SenderName     string
+	SenderID       string
+	ConversationID string
+	Subject        string
+	MessageID      string
+	Date           time.Time
+	Body           string
+	Attachments    []string
 }
 
 func EnsureRuntimeDirs() error {
@@ -53,11 +65,45 @@ func BuildEmailArchiveContent(email ArchivedEmail) string {
 	)
 }
 
+func BuildMessageArchiveContent(message ArchivedMessage) string {
+	body := message.Body
+	if len(message.Attachments) > 0 {
+		body += "\n\nAttachments:\n"
+		for _, attachment := range message.Attachments {
+			body += fmt.Sprintf("- %s\n", attachment)
+		}
+	}
+
+	return fmt.Sprintf(
+		"Source: %s\nSender: %s <%s>\nConversation: %s\nSubject: %s\nMessageID: %s\nDate: %s\n%s\n%s",
+		message.Source,
+		message.SenderName,
+		message.SenderID,
+		message.ConversationID,
+		message.Subject,
+		message.MessageID,
+		message.Date.Format(time.RFC3339),
+		strings.Repeat("-", 50),
+		body,
+	)
+}
+
 func SavePendingEmail(uid uint32, sender string, content string, now time.Time) (string, error) {
-	prefix := strings.ReplaceAll(sender, "@", "_at_")
+	return SavePendingMessage("email", fmt.Sprintf("%d", uid), sender, content, now)
+}
+
+func SavePendingMessage(source, externalID, sender, content string, now time.Time) (string, error) {
+	prefix := strings.NewReplacer("@", "_at_", ":", "-", "/", "-", "\\", "-", " ", "_").Replace(sender)
+	if prefix == "" {
+		prefix = "unknown"
+	}
 	rawTimestamp := now.UTC().Format(time.RFC3339)
 	timestamp := strings.ReplaceAll(strings.ReplaceAll(rawTimestamp, ":", "-"), ".", "-")
-	archiveFile := filepath.Join(PendingDir, fmt.Sprintf("email_%s_%s_%d.txt", prefix, timestamp, uid))
+	externalID = strings.NewReplacer(":", "-", "/", "-", "\\", "-", " ", "_").Replace(externalID)
+	if externalID == "" {
+		externalID = fmt.Sprintf("%d", now.UTC().UnixNano())
+	}
+	archiveFile := filepath.Join(PendingDir, fmt.Sprintf("%s_%s_%s_%s.txt", source, prefix, timestamp, externalID))
 
 	if err := os.WriteFile(archiveFile, []byte(content), 0644); err != nil {
 		return "", err

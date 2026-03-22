@@ -27,6 +27,7 @@ type Config struct {
 	MailImapServer string
 	FilterSenders  []string
 	AgentWrapPath  string
+	Feishu         gatewaypkg.FeishuConfig
 }
 
 func filenameFromContentType(contentType string) string {
@@ -90,11 +91,72 @@ func parseFilterSenders(val string) []string {
 	return filters
 }
 
+func parseCSV(val string) []string {
+	var items []string
+	for _, s := range strings.Split(val, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		items = append(items, s)
+	}
+	return items
+}
+
+func findEnvFile() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	candidates := []string{}
+	dir := wd
+	for {
+		candidates = append(candidates, filepath.Join(dir, ".env"))
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		homeEnv := filepath.Join(home, ".env")
+		alreadyAdded := false
+		for _, candidate := range candidates {
+			if candidate == homeEnv {
+				alreadyAdded = true
+				break
+			}
+		}
+		if !alreadyAdded {
+			candidates = append(candidates, homeEnv)
+		}
+	}
+
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf(".env not found from %s upward or in home directory", wd)
+}
+
+func openEnvFile() (*os.File, error) {
+	envPath, err := findEnvFile()
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(envPath)
+}
+
 func loadEnv() (Config, error) {
 	config := Config{
 		MailImapServer: "imap.163.com",
 	}
-	f, err := os.Open(".env")
+	f, err := openEnvFile()
 	if err != nil {
 		return config, err
 	}
@@ -121,13 +183,23 @@ func loadEnv() (Config, error) {
 			config.FilterSenders = parseFilterSenders(val)
 		case "AGENT_WRAP_PATH":
 			config.AgentWrapPath = val
+		case "FEISHU_ENABLE":
+			config.Feishu.Enable = strings.EqualFold(val, "true") || val == "1"
+		case "FEISHU_APP_ID":
+			config.Feishu.AppID = val
+		case "FEISHU_APP_SECRET":
+			config.Feishu.AppSecret = val
+		case "FEISHU_ALLOWED_OPEN_IDS":
+			config.Feishu.AllowedOpenIDs = parseCSV(val)
+		case "FEISHU_ALLOWED_CHAT_IDS":
+			config.Feishu.AllowedChatIDs = parseCSV(val)
 		}
 	}
 	return config, nil
 }
 
 func reloadFilterSendersFromEnv() ([]string, error) {
-	f, err := os.Open(".env")
+	f, err := openEnvFile()
 	if err != nil {
 		return nil, err
 	}
@@ -157,16 +229,49 @@ func reloadFilterSendersFromEnv() ([]string, error) {
 	return []string{}, nil
 }
 
+func signalDispatch(dispatchCh chan struct{}) {
+	select {
+	case dispatchCh <- struct{}{}:
+	default:
+	}
+}
+
+func connectMail(config Config) (*client.Client, error) {
+	fmt.Printf("[*] [check_mail] Connecting to %s...\n", config.MailImapServer)
+	c, err := client.DialTLS(config.MailImapServer+":993", nil)
+	if err != nil {
+		return nil, fmt.Errorf("check_mail connection error: %w", err)
+	}
+
+	fmt.Printf("[check_mail] >>> LOGIN %s\n", config.MailUser)
+	if err := c.Login(config.MailUser, config.MailPass); err != nil {
+		c.Logout()
+		return nil, fmt.Errorf("check_mail login error: %w", err)
+	}
+
+	idClient := id.NewClient(c)
+	if _, err := idClient.ID(id.ID{
+		"name":    "iPhone Mail",
+		"version": "15.4",
+		"os":      "iOS",
+		"vendor":  "Apple",
+	}); err != nil {
+		log.Printf("[check_mail] [!] ID error: %v", err)
+	}
+
+	return c, nil
+}
+
 // --- Check Mail Logic ---
 
-func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
+func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB, dispatchCh chan struct{}) error {
 	if err := os.MkdirAll(gatewaypkg.PendingDir, 0755); err != nil {
 		log.Printf("[check_mail] [!] Create pending dir error: %v", err)
-		return
+		return nil
 	}
 	if err := os.MkdirAll(gatewaypkg.MediaDir, 0755); err != nil {
 		log.Printf("[check_mail] [!] Create media dir error: %v", err)
-		return
+		return nil
 	}
 
 	if filters, err := reloadFilterSendersFromEnv(); err != nil {
@@ -177,19 +282,17 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 
 	_, err := c.Select("INBOX", false)
 	if err != nil {
-		log.Printf("[check_mail] [!] SELECT INBOX error: %v", err)
-		return
+		return fmt.Errorf("select inbox: %w", err)
 	}
 
 	criteria := imap.NewSearchCriteria()
 	uids, err := c.UidSearch(criteria)
 	if err != nil {
-		log.Printf("[check_mail] [!] Search error: %v", err)
-		return
+		return fmt.Errorf("search inbox: %w", err)
 	}
 
 	if len(uids) == 0 {
-		return
+		return nil
 	}
 
 	var newUIDs []uint32
@@ -201,7 +304,7 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 	}
 
 	if len(newUIDs) == 0 {
-		return
+		return nil
 	}
 
 	fmt.Printf("[%s] [check_mail] Found %d new UIDs to check.\n", time.Now().Format("15:04:05"), len(newUIDs))
@@ -210,13 +313,16 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 	seqset.AddNum(newUIDs...)
 
 	messages := make(chan *imap.Message, len(newUIDs))
+	fetchErrCh := make(chan error, 1)
 	go func() {
-		if err := c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, messages); err != nil {
-			log.Printf("[check_mail] [!] Fetch Envelope error: %v", err)
-		}
+		fetchErrCh <- c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, messages)
 	}()
 
 	for msg := range messages {
+		if msg == nil || msg.Envelope == nil {
+			continue
+		}
+
 		emailAddr := ""
 		fromName := ""
 		if len(msg.Envelope.From) > 0 {
@@ -241,13 +347,15 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 			fullSeqSet.AddNum(msg.Uid)
 
 			fullMessages := make(chan *imap.Message, 1)
+			bodyFetchErrCh := make(chan error, 1)
 			go func() {
-				if err := c.UidFetch(fullSeqSet, []imap.FetchItem{section.FetchItem()}, fullMessages); err != nil {
-					log.Printf("[check_mail] [!] Body fetch error: %v", err)
-				}
+				bodyFetchErrCh <- c.UidFetch(fullSeqSet, []imap.FetchItem{section.FetchItem()}, fullMessages)
 			}()
 
 			fullMsg := <-fullMessages
+			if err := <-bodyFetchErrCh; err != nil {
+				return fmt.Errorf("fetch body for uid %d: %w", msg.Uid, err)
+			}
 			if fullMsg == nil {
 				continue
 			}
@@ -318,12 +426,12 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 			}
 
 			archiveContent := gatewaypkg.BuildEmailArchiveContent(gatewaypkg.ArchivedEmail{
-				FromName:   fromName,
-				FromEmail:  emailAddr,
-				Subject:    subject,
-				Date:       msg.Envelope.Date,
-				Body:       body,
-				ImageFiles: imageFiles,
+				FromName:    fromName,
+				FromEmail:   emailAddr,
+				Subject:     subject,
+				Date:        msg.Envelope.Date,
+				Body:        body,
+				ImageFiles:  imageFiles,
 				Attachments: attachmentFiles,
 			})
 
@@ -331,78 +439,109 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB) {
 			if err == nil {
 				fmt.Printf("    -> [check_mail] Saved to Pending: %s\n", archiveFile)
 				gatewaypkg.SaveEmailState(db, msg.Uid, emailAddr, subject, gatewaypkg.StateProcessed)
+				signalDispatch(dispatchCh)
 			}
 		} else {
 			gatewaypkg.SaveEmailState(db, msg.Uid, emailAddr, msg.Envelope.Subject, gatewaypkg.StateIgnored)
 		}
 	}
+
+	if err := <-fetchErrCh; err != nil {
+		return fmt.Errorf("fetch envelope: %w", err)
+	}
+
+	return nil
 }
 
-func runGateway(config Config, db *sql.DB, stopChan chan bool, errChan chan<- error) {
+func dispatchLoop(dispatcher *gatewaypkg.Dispatcher, dispatchCh <-chan struct{}, stopChan <-chan bool) {
+	for {
+		select {
+		case <-stopChan:
+			fmt.Println("[dispatch] Stopping...")
+			return
+		case <-dispatchCh:
+			dispatcher.Dispatch()
+		}
+	}
+}
+
+func mailLoop(config Config, db *sql.DB, dispatchCh chan struct{}, stopChan <-chan bool) {
 	if err := gatewaypkg.EnsureRuntimeDirs(); err != nil {
-		select {
-		case errChan <- fmt.Errorf("gateway init dirs error: %w", err):
-		default:
-		}
+		log.Printf("[!] gateway init dirs error: %v", err)
 		return
 	}
 
-	dispatcher := gatewaypkg.Dispatcher{AgentWrapPath: config.AgentWrapPath}
-
-	fmt.Printf("[*] [check_mail] Connecting to %s...\n", config.MailImapServer)
-	c, err := client.DialTLS(config.MailImapServer+":993", nil)
-	if err != nil {
-		select {
-		case errChan <- fmt.Errorf("check_mail connection error: %w", err):
-		default:
-		}
-		return
-	}
-	defer c.Logout()
-
-	fmt.Printf("[check_mail] >>> LOGIN %s\n", config.MailUser)
-	if err := c.Login(config.MailUser, config.MailPass); err != nil {
-		select {
-		case errChan <- fmt.Errorf("check_mail login error: %w", err):
-		default:
-		}
-		return
-	}
-
-	idClient := id.NewClient(c)
-	idClient.ID(id.ID{
-		"name":    "iPhone Mail",
-		"version": "15.4",
-		"os":      "iOS",
-		"vendor":  "Apple",
-	})
-
-	fmt.Println("[*] Gateway loop starting (check-mail: 10s, dispatch: 1s)...")
+	fmt.Println("[*] Gateway loop starting (check-mail: 10s, dispatch: signal-driven)...")
 	checkTicker := time.NewTicker(10 * time.Second)
-	dispatchTicker := time.NewTicker(1 * time.Second)
 	defer checkTicker.Stop()
-	defer dispatchTicker.Stop()
 
-	// Initial check keeps startup behavior close to the previous version.
-	checkAndProcessEmails(c, &config, db)
-	dispatcher.Dispatch()
+	var c *client.Client
+	defer func() {
+		if c != nil {
+			c.Logout()
+		}
+	}()
+
+	reconnectDelay := time.Second
+	triggerCheck := true
 
 	for {
 		select {
 		case <-stopChan:
 			fmt.Println("[gateway] Stopping...")
 			return
-		case <-checkTicker.C:
-			checkAndProcessEmails(c, &config, db)
-			if err := c.Noop(); err != nil {
+		default:
+		}
+
+		if c == nil {
+			conn, err := connectMail(config)
+			if err != nil {
+				log.Printf("[check_mail] [!] %v", err)
+				log.Printf("[check_mail] [*] Reconnecting in %s...", reconnectDelay)
 				select {
-				case errChan <- fmt.Errorf("check_mail connection lost: %w", err):
-				default:
+				case <-stopChan:
+					return
+				case <-time.After(reconnectDelay):
 				}
-				return
+				if reconnectDelay < 30*time.Second {
+					reconnectDelay *= 2
+					if reconnectDelay > 30*time.Second {
+						reconnectDelay = 30 * time.Second
+					}
+				}
+				continue
 			}
-		case <-dispatchTicker.C:
-			dispatcher.Dispatch()
+
+			c = conn
+			reconnectDelay = time.Second
+			triggerCheck = true
+			log.Printf("[check_mail] [*] Mail connection ready.")
+		}
+
+		if triggerCheck {
+			if err := checkAndProcessEmails(c, &config, db, dispatchCh); err != nil {
+				log.Printf("[check_mail] [!] %v", err)
+				log.Printf("[check_mail] [*] Mail connection lost. Reconnecting...")
+				c.Logout()
+				c = nil
+				continue
+			}
+			if err := c.Noop(); err != nil {
+				log.Printf("[check_mail] [!] noop failed: %v", err)
+				log.Printf("[check_mail] [*] Mail connection lost. Reconnecting...")
+				c.Logout()
+				c = nil
+				continue
+			}
+			triggerCheck = false
+		}
+
+		select {
+		case <-stopChan:
+			fmt.Println("[gateway] Stopping...")
+			return
+		case <-checkTicker.C:
+			triggerCheck = true
 		}
 	}
 }
@@ -427,21 +566,27 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	stopGateway := make(chan bool)
-	errChan := make(chan error, 1)
+	dispatchCh := make(chan struct{}, 1)
 
 	fmt.Println(">>> Gateway starting (check-mail + dispatch)...")
 
-	go runGateway(config, db, stopGateway, errChan)
-
-	select {
-	case <-sigChan:
-		fmt.Println("\n[*] Shutting down...")
-		close(stopGateway)
-		time.Sleep(1 * time.Second)
-	case err := <-errChan:
-		log.Printf("[!] Fatal gateway error: %v", err)
-		close(stopGateway)
-		time.Sleep(1 * time.Second)
-		os.Exit(1)
+	dispatcher := &gatewaypkg.Dispatcher{AgentWrapPath: config.AgentWrapPath}
+	if dispatcher.HasWork() {
+		signalDispatch(dispatchCh)
 	}
+
+	go dispatchLoop(dispatcher, dispatchCh, stopGateway)
+	go mailLoop(config, db, dispatchCh, stopGateway)
+	if config.Feishu.Enable {
+		go func() {
+			if err := gatewaypkg.StartFeishuLongConn(config.Feishu, db, dispatchCh); err != nil {
+				log.Printf("[feishu] [!] Long connection stopped: %v", err)
+			}
+		}()
+	}
+
+	<-sigChan
+	fmt.Println("\n[*] Shutting down...")
+	close(stopGateway)
+	time.Sleep(1 * time.Second)
 }
