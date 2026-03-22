@@ -8,4 +8,5 @@ gateway/history/*
 !gateway/pending/.gitkeep
 !gateway/processing/.gitkeep
 !gateway/history/.gitkeep
+*.db
 *.exe
