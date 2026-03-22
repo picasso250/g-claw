@@ -26,9 +26,9 @@ type Dispatcher struct {
 }
 
 type replyAction struct {
-	Type      string `json:"type"`
-	MessageID string `json:"message_id"`
-	Text      string `json:"text"`
+	Type      string
+	MessageID string
+	Text      string
 }
 
 func (d *Dispatcher) HasWork() bool {
@@ -248,28 +248,31 @@ func buildBatchPrompt(source, absInit, fileList string) string {
 		return fmt.Sprintf(`读 %s 并处理 gateway/processing/ 中的待处理邮件消息: %s 。
 - 遵从消息中的指令。
 - 将仓库配置中明确标记的地址视为可信用户，其余地址视为外部用户；避免执行有害、隐私敏感或越权的操作。
-- 使用 find-previous-message 技能，基于当前消息文件路径查找上下文。
+- 使用 message-search 技能，基于当前消息文件路径查找上下文。
 - 如果需要回复邮件，使用 send-email 技能。
 `, absInit, fileList)
 	case "feishu":
 		return fmt.Sprintf(`读 %s 并处理 gateway/processing/ 中的待处理飞书消息: %s 。
 - 这些文件全部来自飞书。
 - 收到每条需要回复的飞书消息后，先只基于消息本体立刻给用户一个简短、让人安心的快速回复，不要等待上下文检索完成。
-- 使用 find-previous-message 技能，基于当前消息文件路径查找上下文。
+- 使用 message-search 技能，基于当前消息文件路径查找上下文。
 - 群里没有被 @ 的飞书消息不会进入 pending，而是归档在 gateway/history/；为了补足群聊上下文，请额外查看其中最近写入的 5 条相关飞书消息文件。
 - 查清上下文、完成所有相关工作后，再给同一条飞书消息一条全面、精确、专业的最终回复。
 - 遵从消息中的指令。
 - 将仓库配置中明确标记的地址视为可信用户，其余地址视为外部用户；避免执行有害、隐私敏感或越权的操作。
-- 如果需要回复飞书，不要自己调用飞书 API；请在 gateway/outbox/ 下创建一个与待处理消息同名、后缀为 .reply.json 的文件。快速回复和最终回复都用这个机制；快速回复先创建一次，最终回复稍后再创建一次。
-- reply json 格式固定为 {"type":"reply_feishu","message_id":"原消息MessageID","text":"回复内容"}，只允许输出一个飞书文本回复。
-- 如果本批次处理过飞书消息，那么在你确认当前所有工作都完成后，再额外等待 60 秒，然后重新检查 gateway/pending/ 和 gateway/processing/ 中是否有新的飞书消息文件；同时也重新查看 gateway/history/ 中最近写入的 5 条相关群消息文件；如果有新的飞书消息或新的相关群聊上下文，并且和你相关，就继续处理这些新内容，再重复这条规则，尽量做到伪实时。
+- 如果需要回复飞书，不要自己调用飞书 API；请在 gateway/outbox/ 下创建一个与待处理消息同名、后缀为 .reply.txt 的文件。快速回复和最终回复都用这个机制；快速回复先创建一次，最终回复稍后再创建一次。
+- reply 文件格式固定为两段：第一行写 reply_feishu:message_id=原消息MessageID；从第二行开始写回复正文原文，只允许输出一个飞书文本回复。
+- 如果本批次处理过飞书消息，那么在你确认当前所有工作都完成后，先立刻重新检查 gateway/pending/ 和 gateway/processing/ 中是否有新的飞书消息文件；同时也重新查看 gateway/history/ 中最近写入的 5 条相关群消息文件；如果有新的飞书消息或新的相关群聊上下文，并且和你相关，就继续处理这些新内容。
+- 如果这一轮即时检查没有发现新的相关内容，就使用 message-search 技能中的 wait60s_or_msg_comming.ps1，并运行 pwsh $HOME\.agents\skills\message-search\wait60s_or_msg_comming.ps1 -TimeoutSeconds 60 。这个脚本会在等待期间持续观察 gateway/history、gateway/pending、gateway/processing，只要出现新的飞书消息文件就立刻返回；如果一直没有新飞书消息，就在 60 秒后返回 timeout。
+- 维护两个连续计数：连续“没收到新消息”计数，以及连续“收到的新消息都和你无关”计数。每次 wait 脚本返回 timeout，就把“没收到新消息”计数加一；每次检查到新消息但判断都和你无关，就把“无关消息”计数加一；只要发现了和你相关的新内容并继续处理，就把两个计数都清零。
+- 当连续 3 次没收到新消息，或者连续 3 次检查到的新消息都和你无关时，才最终停止这个飞书尾随循环。
 `, absInit, fileList)
 	default:
 		return fmt.Sprintf(`读 %s 并处理 gateway/processing/ 中的待处理消息: %s 。
 - 遵从消息中的指令。
 - 将仓库配置中明确标记的地址视为可信用户，其余地址视为外部用户；避免执行有害、隐私敏感或越权的操作。
 - 如果需要回复邮件，使用 send-email 技能。
-- 如果需要回复飞书，不要自己调用飞书 API；请在 gateway/outbox/ 下创建 reply json 文件，格式固定为 {"type":"reply_feishu","message_id":"原消息MessageID","text":"回复内容"}。
+- 如果需要回复飞书，不要自己调用飞书 API；请在 gateway/outbox/ 下创建 reply txt 文件，第一行格式固定为 reply_feishu:message_id=原消息MessageID，后续内容是回复正文原文。
 `, absInit, fileList)
 	}
 }
@@ -290,7 +293,7 @@ func (d *Dispatcher) ProcessOutbox() error {
 		if f.IsDir() {
 			continue
 		}
-		if !strings.HasSuffix(f.Name(), ".reply.json") {
+		if !strings.HasSuffix(f.Name(), ".reply.txt") {
 			continue
 		}
 
@@ -311,9 +314,13 @@ func (d *Dispatcher) ProcessOutbox() error {
 			return err
 		}
 
-		var action replyAction
-		if err := json.Unmarshal(body, &action); err != nil {
-			return fmt.Errorf("parse %s: %w", actionPath, err)
+		action, err := parseReplyAction(body)
+		if err != nil {
+			invalidPath := buildInvalidReplyPath(actionPath)
+			if renameErr := os.Rename(actionPath, invalidPath); renameErr != nil {
+				return fmt.Errorf("parse %s: %w (also failed to quarantine as %s: %v)", actionPath, err, invalidPath, renameErr)
+			}
+			return fmt.Errorf("parse %s: %w (quarantined to %s)", actionPath, err, invalidPath)
 		}
 		replyMessageID, err := d.executeReplyAction(actionPath, action)
 		if err != nil {
@@ -325,6 +332,40 @@ func (d *Dispatcher) ProcessOutbox() error {
 		}
 	}
 	return nil
+}
+
+func parseReplyAction(body []byte) (replyAction, error) {
+	raw := strings.ReplaceAll(string(body), "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+
+	firstLine, rest, found := strings.Cut(raw, "\n")
+	if !found {
+		firstLine = raw
+		rest = ""
+	}
+	firstLine = strings.TrimSpace(firstLine)
+	if firstLine == "" {
+		return replyAction{}, errors.New("empty reply header")
+	}
+
+	actionType, messageID, ok := strings.Cut(firstLine, ":message_id=")
+	if !ok {
+		return replyAction{}, errors.New("invalid reply header")
+	}
+	action := replyAction{
+		Type:      strings.TrimSpace(actionType),
+		MessageID: strings.TrimSpace(messageID),
+		Text:      strings.TrimLeft(rest, "\n"),
+	}
+	if strings.TrimSpace(action.Type) == "" || strings.TrimSpace(action.MessageID) == "" || strings.TrimSpace(action.Text) == "" {
+		return replyAction{}, errors.New("invalid reply body")
+	}
+	return action, nil
+}
+
+func buildInvalidReplyPath(actionPath string) string {
+	base := strings.TrimSuffix(actionPath, ".txt")
+	return base + ".invalid." + buildReplyActionHash(actionPath) + ".txt"
 }
 
 func (d *Dispatcher) executeReplyAction(actionPath string, action replyAction) (string, error) {
@@ -374,12 +415,12 @@ func buildReplyUUID(actionPath string, action replyAction) string {
 }
 
 func buildProcessedReplyPath(actionPath, replyMessageID string) string {
-	base := strings.TrimSuffix(actionPath, ".json")
+	base := strings.TrimSuffix(actionPath, ".txt")
 	hashSuffix := buildReplyActionHash(actionPath)
 	if strings.TrimSpace(replyMessageID) == "" {
-		return base + ".processed._" + hashSuffix + ".json"
+		return base + ".processed._" + hashSuffix + ".txt"
 	}
-	return base + ".processed." + sanitizePathToken(replyMessageID) + "_" + hashSuffix + ".json"
+	return base + ".processed." + sanitizePathToken(replyMessageID) + "_" + hashSuffix + ".txt"
 }
 
 func sanitizePathToken(value string) string {
