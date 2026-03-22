@@ -31,7 +31,7 @@ type ArchivedMessage struct {
 }
 
 func EnsureRuntimeDirs() error {
-	for _, dir := range []string{PendingDir, ProcessingDir, HistoryDir, MediaDir} {
+	for _, dir := range []string{PendingDir, ProcessingDir, HistoryDir, MediaDir, OutboxDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
 		}
@@ -93,6 +93,14 @@ func SavePendingEmail(uid uint32, sender string, content string, now time.Time) 
 }
 
 func SavePendingMessage(source, externalID, sender, content string, now time.Time) (string, error) {
+	return saveArchivedMessage(PendingDir, source, externalID, sender, content, now)
+}
+
+func SaveHistoryMessage(source, externalID, sender, content string, now time.Time) (string, error) {
+	return saveArchivedMessage(HistoryDir, source, externalID, sender, content, now)
+}
+
+func saveArchivedMessage(dir, source, externalID, sender, content string, now time.Time) (string, error) {
 	prefix := strings.NewReplacer("@", "_at_", ":", "-", "/", "-", "\\", "-", " ", "_").Replace(sender)
 	if prefix == "" {
 		prefix = "unknown"
@@ -103,7 +111,7 @@ func SavePendingMessage(source, externalID, sender, content string, now time.Tim
 	if externalID == "" {
 		externalID = fmt.Sprintf("%d", now.UTC().UnixNano())
 	}
-	archiveFile := filepath.Join(PendingDir, fmt.Sprintf("%s_%s_%s_%s.txt", source, prefix, timestamp, externalID))
+	archiveFile := filepath.Join(dir, fmt.Sprintf("%s_%s_%s_%s.txt", source, prefix, timestamp, externalID))
 
 	if err := os.WriteFile(archiveFile, []byte(content), 0644); err != nil {
 		return "", err

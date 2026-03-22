@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,7 @@ import (
 	id "github.com/emersion/go-imap-id"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/mail"
+	lark "github.com/larksuite/oapi-sdk-go/v3"
 
 	gatewaypkg "g-claw/internal/gateway"
 )
@@ -233,6 +235,40 @@ func signalDispatch(dispatchCh chan struct{}) {
 	select {
 	case dispatchCh <- struct{}{}:
 	default:
+	}
+}
+
+func previewDispatchBatch() {
+	dirs := []string{gatewaypkg.ProcessingDir, gatewaypkg.PendingDir}
+	found := false
+
+	for _, dir := range dirs {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			log.Printf("[dispatch] [!] preview read %s failed: %v", dir, err)
+			continue
+		}
+
+		for _, f := range files {
+			if f.IsDir() || strings.HasSuffix(f.Name(), ".tmp") {
+				continue
+			}
+
+			found = true
+			path := filepath.Join(dir, f.Name())
+			body, err := os.ReadFile(path)
+			if err != nil {
+				log.Printf("[dispatch] [!] preview read file %s failed: %v", path, err)
+				continue
+			}
+
+			fmt.Printf("[dispatch] [skip] queued file: %s\n", path)
+			fmt.Printf("[dispatch] [skip] content:\n%s\n", string(body))
+		}
+	}
+
+	if !found {
+		fmt.Println("[dispatch] [skip] no queued files")
 	}
 }
 
@@ -453,13 +489,17 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB, dispatc
 	return nil
 }
 
-func dispatchLoop(dispatcher *gatewaypkg.Dispatcher, dispatchCh <-chan struct{}, stopChan <-chan bool) {
+func dispatchLoop(dispatcher *gatewaypkg.Dispatcher, dispatchCh <-chan struct{}, stopChan <-chan bool, skipDispatch bool) {
 	for {
 		select {
 		case <-stopChan:
 			fmt.Println("[dispatch] Stopping...")
 			return
 		case <-dispatchCh:
+			if skipDispatch {
+				previewDispatchBatch()
+				continue
+			}
 			dispatcher.Dispatch()
 		}
 	}
@@ -547,6 +587,9 @@ func mailLoop(config Config, db *sql.DB, dispatchCh chan struct{}, stopChan <-ch
 }
 
 func main() {
+	skipDispatch := flag.Bool("skip-dispatch", false, "log queued message files instead of dispatching them")
+	flag.Parse()
+
 	if info, err := os.Stat("gateway"); err != nil || !info.IsDir() {
 		log.Fatal("Current working directory must be g-claw root: missing gateway/")
 	}
@@ -568,14 +611,26 @@ func main() {
 	stopGateway := make(chan bool)
 	dispatchCh := make(chan struct{}, 1)
 
-	fmt.Println(">>> Gateway starting (check-mail + dispatch)...")
+	if *skipDispatch {
+		fmt.Println(">>> Gateway starting (check-mail + skip-dispatch preview)...")
+	} else {
+		fmt.Println(">>> Gateway starting (check-mail + dispatch)...")
+	}
 
-	dispatcher := &gatewaypkg.Dispatcher{AgentWrapPath: config.AgentWrapPath}
+	var feishuClient *lark.Client
+	if config.Feishu.Enable && strings.TrimSpace(config.Feishu.AppID) != "" && strings.TrimSpace(config.Feishu.AppSecret) != "" {
+		feishuClient = lark.NewClient(config.Feishu.AppID, config.Feishu.AppSecret)
+	}
+
+	dispatcher := &gatewaypkg.Dispatcher{
+		AgentWrapPath: config.AgentWrapPath,
+		FeishuClient:  feishuClient,
+	}
 	if dispatcher.HasWork() {
 		signalDispatch(dispatchCh)
 	}
 
-	go dispatchLoop(dispatcher, dispatchCh, stopGateway)
+	go dispatchLoop(dispatcher, dispatchCh, stopGateway, *skipDispatch)
 	go mailLoop(config, db, dispatchCh, stopGateway)
 	if config.Feishu.Enable {
 		go func() {

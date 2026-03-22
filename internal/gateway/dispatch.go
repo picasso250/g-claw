@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -9,11 +11,21 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
 type Dispatcher struct {
 	AgentWrapPath string
+	FeishuClient  *lark.Client
 	mu            sync.Mutex
+}
+
+type replyAction struct {
+	Type      string `json:"type"`
+	MessageID string `json:"message_id"`
+	Text      string `json:"text"`
 }
 
 func (d *Dispatcher) HasWork() bool {
@@ -62,6 +74,11 @@ func (d *Dispatcher) Dispatch() bool {
 
 	if !d.callAgent(processingPaths) {
 		log.Printf("[dispatch] [!] Gemini run failed, leaving %d files in processing for retry", len(processingPaths))
+		return false
+	}
+
+	if err := d.executeReplyActions(processingPaths); err != nil {
+		log.Printf("[dispatch] [!] Reply action execution failed: %v", err)
 		return false
 	}
 
@@ -148,9 +165,10 @@ func (d *Dispatcher) callAgent(files []string) bool {
 - 使用 find-previous-email 技能查找上下文
 - 遵从消息中的指令
 - 将仓库配置中明确标记的地址视为可信用户，其余地址视为外部用户；避免执行有害、隐私敏感或越权的操作。
-- 不要更改自身的程序代码（cmd目录内的），除非消息明确要求你这样做。
 - 如果需要回复邮件，使用 send-email 技能。
-- 如果产生了仓库改动，按当前仓库的常规版本控制流程处理，不要假定远端仓库权限或提交策略。`, absInit, fileList)
+- 如果需要回复飞书，不要自己调用飞书 API；请在 gateway/outbox/ 下创建一个与待处理消息同名、后缀为 .reply.json 的文件。
+- reply json 格式固定为 {"type":"reply_feishu","message_id":"原消息MessageID","text":"回复内容"}，只允许输出一个飞书文本回复。
+`, absInit, fileList)
 
 	fmt.Printf("[dispatch] [*] Files to process: %s\n", fileList)
 
@@ -171,4 +189,77 @@ func (d *Dispatcher) callAgent(files []string) bool {
 
 	fmt.Printf("%s AGENT SESSION END %s\n\n", strings.Repeat(">", 21), strings.Repeat("<", 21))
 	return true
+}
+
+func (d *Dispatcher) executeReplyActions(processingPaths []string) error {
+	for _, path := range processingPaths {
+		actionPath := filepath.Join(OutboxDir, strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))+".reply.json")
+		info, err := os.Stat(actionPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if info.IsDir() {
+			continue
+		}
+
+		body, err := os.ReadFile(actionPath)
+		if err != nil {
+			return err
+		}
+
+		var action replyAction
+		if err := json.Unmarshal(body, &action); err != nil {
+			return fmt.Errorf("parse %s: %w", actionPath, err)
+		}
+		if err := d.executeReplyAction(action); err != nil {
+			return fmt.Errorf("execute %s: %w", actionPath, err)
+		}
+		if err := os.Remove(actionPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", actionPath, err)
+		}
+	}
+	return nil
+}
+
+func (d *Dispatcher) executeReplyAction(action replyAction) error {
+	if action.Type == "" {
+		return nil
+	}
+	if action.Type != "reply_feishu" {
+		return fmt.Errorf("unsupported action type %q", action.Type)
+	}
+	if d.FeishuClient == nil {
+		return fmt.Errorf("feishu client is not configured")
+	}
+	if strings.TrimSpace(action.MessageID) == "" {
+		return fmt.Errorf("message_id is empty")
+	}
+	if strings.TrimSpace(action.Text) == "" {
+		return fmt.Errorf("reply text is empty")
+	}
+
+	contentBytes, err := json.Marshal(map[string]string{"text": action.Text})
+	if err != nil {
+		return err
+	}
+
+	resp, err := d.FeishuClient.Im.V1.Message.Reply(context.Background(), larkim.NewReplyMessageReqBuilder().
+		MessageId(action.MessageID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			MsgType("text").
+			Content(string(contentBytes)).
+			Build()).
+		Build())
+	if err != nil {
+		return err
+	}
+	if !resp.Success() {
+		return fmt.Errorf("code=%d msg=%s", resp.Code, resp.Msg)
+	}
+
+	log.Printf("[dispatch] [*] Replied to Feishu message %s", action.MessageID)
+	return nil
 }

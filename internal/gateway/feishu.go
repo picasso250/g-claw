@@ -103,19 +103,32 @@ func handleFeishuEvent(config FeishuConfig, db *sql.DB, dispatchCh chan struct{}
 		Body:           body,
 	})
 
-	archiveFile, err := SavePendingMessage("feishu", messageID, senderOpenID, archiveContent, time.Now())
-	if err != nil {
-		return fmt.Errorf("save pending for %s: %w", messageID, err)
+	shouldDispatch := shouldDispatchFeishuMessage(chatType, message.Mentions)
+	var archiveFile string
+	if shouldDispatch {
+		archiveFile, err = SavePendingMessage("feishu", messageID, senderOpenID, archiveContent, time.Now())
+		if err != nil {
+			return fmt.Errorf("save pending for %s: %w", messageID, err)
+		}
+	} else {
+		archiveFile, err = SaveHistoryMessage("feishu", messageID, senderOpenID, archiveContent, time.Now())
+		if err != nil {
+			return fmt.Errorf("save history for %s: %w", messageID, err)
+		}
 	}
 
 	if err := SaveMessageState(db, "feishu", messageID, senderOpenID, chatType, StateProcessed); err != nil {
 		return fmt.Errorf("save state for %s: %w", messageID, err)
 	}
 
-	log.Printf("[feishu] [*] Saved message %s to %s", messageID, archiveFile)
-	select {
-	case dispatchCh <- struct{}{}:
-	default:
+	if shouldDispatch {
+		log.Printf("[feishu] [*] Queued message %s for dispatch at %s", messageID, archiveFile)
+		select {
+		case dispatchCh <- struct{}{}:
+		default:
+		}
+	} else {
+		log.Printf("[feishu] [*] Archived message %s to %s", messageID, archiveFile)
 	}
 	return nil
 }
@@ -178,6 +191,16 @@ func isFeishuMessageAllowed(config FeishuConfig, senderOpenID, chatID string) bo
 		return true
 	}
 	return false
+}
+
+func shouldDispatchFeishuMessage(chatType string, mentions []*larkim.MentionEvent) bool {
+	if chatType == "p2p" {
+		return true
+	}
+	if chatType != "group" && chatType != "topic_group" {
+		return false
+	}
+	return len(mentions) > 0
 }
 
 func derefString(value *string) string {
