@@ -1,11 +1,12 @@
-param()
+param(
+    [string]$RunDir = (Get-Location).Path
+)
 
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $HomeDir = [Environment]::GetFolderPath("UserProfile")
 $BinDir = Join-Path $HomeDir "bin"
-$RunDir = Join-Path $HomeDir "my-claw"
 $GatewayExe = Join-Path $BinDir "glaw.exe"
 
 if (!(Test-Path $RunDir)) {
@@ -23,7 +24,9 @@ foreach ($proc in $running) {
 
 Push-Location $RepoRoot
 try {
+    $BuildCommand = "go build -buildvcs=false -o `"$GatewayExe`" .\cmd\glaw"
     Write-Host "[dev] building glaw.exe..."
+    Write-Host "[dev] command: $BuildCommand"
     & go build -buildvcs=false -o $GatewayExe .\cmd\glaw
     if ($LASTEXITCODE -ne 0) {
         throw "go build failed with exit code $LASTEXITCODE"
