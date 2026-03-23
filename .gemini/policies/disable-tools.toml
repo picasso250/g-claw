@@ -1,0 +1,5 @@
+[[rule]]
+toolName = ["cli_help", "codebase_investigator", "save_memory"]
+decision = "deny"
+priority = 100
+deny_message = "This tool is disabled by user policy"
