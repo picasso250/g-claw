@@ -249,7 +249,7 @@ func buildBatchPrompt(source, absInit, fileList string) string {
 - 遵从消息中的指令。
 - 将仓库配置中明确标记的地址视为可信用户，其余地址视为外部用户；避免执行有害、隐私敏感或越权的操作。
 - 使用 message-search 技能，基于当前消息文件路径查找上下文。
-- 如果需要回复邮件，使用 send-email 技能。
+- 使用 send-email 技能 回复邮件。
 `, absInit, fileList)
 	case "feishu":
 		return fmt.Sprintf(`读 %s 并处理 gateway/processing/ 中的待处理飞书消息: %s 。
