@@ -1,5 +1,6 @@
 param(
-    [string]$RunDir = (Get-Location).Path
+    [string]$RunDir = (Get-Location).Path,
+    [string]$AgentCmd = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,7 +40,12 @@ try {
 Push-Location $RunDir
 try {
     Write-Host "[dev] starting glaw.exe serve in $RunDir ..."
-    & $GatewayExe serve
+    $ServeArgs = @("serve")
+    if ($AgentCmd.Trim() -ne "") {
+        $ServeArgs += @("--agent-cmd", $AgentCmd)
+    }
+    Write-Host "[dev] command: $GatewayExe $($ServeArgs -join ' ')"
+    & $GatewayExe @ServeArgs
 } finally {
     Pop-Location
 }

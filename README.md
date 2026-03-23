@@ -40,6 +40,18 @@ Start:
 go run ./cmd/glaw serve
 ```
 
+Temporarily override the assistant runner for one `serve` process:
+
+```powershell
+go run ./cmd/glaw serve --agent-cmd "gemini --yolo -p"
+```
+
+If the runner path itself contains spaces, wrap the whole argument in single quotes so PowerShell passes it through unchanged:
+
+```powershell
+go run ./cmd/glaw serve --agent-cmd '"C:\Program Files\nodejs\node.exe" C:\Users\MECHREV\AppData\Roaming\npm\node_modules\opencode-ai\bin\opencode -m zhipuai-coding-plan/glm-5 run'
+```
+
 Build a local executable:
 
 ```powershell
@@ -56,6 +68,12 @@ Dev loop:
 
 ```powershell
 .\dev.ps1
+```
+
+Dev loop with a one-off agent command override:
+
+```powershell
+.\dev.ps1 -AgentCmd "gemini --yolo -p"
 ```
 
 The process expects to be started from the repository root so it can access `gateway/` and `INIT.md`.

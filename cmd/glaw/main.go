@@ -618,6 +618,7 @@ func runServe(args []string) error {
 	}
 	defer db.Close()
 
+	agentCmd := fs.String("agent-cmd", "", "override AGENT_CMD from .env for this serve process")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
@@ -633,6 +634,9 @@ func runServe(args []string) error {
 	feishuEnabled := strings.TrimSpace(config.Feishu.AppID) != "" && strings.TrimSpace(config.Feishu.AppSecret) != ""
 	config.Feishu.Enable = feishuEnabled
 
+	if strings.TrimSpace(*agentCmd) != "" {
+		config.AgentCmd = *agentCmd
+	}
 	var feishuClient *lark.Client
 	if feishuEnabled {
 		feishuClient = lark.NewClient(config.Feishu.AppID, config.Feishu.AppSecret)
@@ -788,7 +792,7 @@ func runFeishu(args []string) error {
 
 func usage() string {
 	return strings.TrimSpace(`Usage:
-  glaw serve [--skip-dispatch]
+  glaw serve [--skip-dispatch] [--agent-cmd <command-prefix>]
   glaw feishu list-messages -chat-id <chat_id> [-page-size 20] [-minutes 120]`)
 }
 
