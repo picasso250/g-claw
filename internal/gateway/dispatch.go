@@ -183,7 +183,7 @@ func (d *Dispatcher) callAgent(files []string) bool {
 
 	cmd := exec.Command(commandParts[0], commandParts[1:]...)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = DebugMirrorWriter(os.Stderr)
 
 	fmt.Printf("[dispatch] [*] Executing agent command: %s\n", d.AgentCmd)
 	if err := cmd.Run(); err != nil {

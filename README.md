@@ -123,15 +123,7 @@ Send a Feishu reply directly and get immediate success or failure feedback:
 ~/bin/glaw.exe feishu send -message-id <message_id> -file .\answer.docx
 ```
 
-The command writes the corresponding reply record into `gateway/outbox/` for audit, executes it immediately, and prints whether the send succeeded.
-
-## Feishu Outbox Reply Format
-
-The old `.reply.txt` format still works for background processing:
-
-- text reply: first line `reply_feishu:message_id=<message_id>`, remaining content is the text body
-- image reply: first line `reply_feishu_image:message_id=<message_id>`, remaining content is one local image path
-- file reply: first line `reply_feishu_file:message_id=<message_id>`, remaining content is one local file path such as a `.docx`
+The command sends immediately and prints whether the send succeeded.
 
 ## Feishu Context Lessons
 

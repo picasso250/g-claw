@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -34,6 +35,9 @@ type Config struct {
 	AgentCmd       string
 	Feishu         gatewaypkg.FeishuConfig
 }
+
+var debugLogger *log.Logger
+var debugLogWriter io.Writer
 
 func filenameFromContentType(contentType string) string {
 	switch contentType {
@@ -513,27 +517,6 @@ func dispatchLoop(dispatcher *gatewaypkg.Dispatcher, dispatchCh <-chan struct{},
 	}
 }
 
-func outboxLoop(dispatcher *gatewaypkg.Dispatcher, stopChan <-chan bool, skipDispatch bool) {
-	if skipDispatch {
-		return
-	}
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-stopChan:
-			fmt.Println("[outbox] Stopping...")
-			return
-		case <-ticker.C:
-			if err := dispatcher.ProcessOutbox(); err != nil {
-				log.Printf("[outbox] [!] %v", err)
-			}
-		}
-	}
-}
-
 func mailLoop(config Config, db *sql.DB, dispatchCh chan struct{}, stopChan <-chan bool) {
 	if err := gatewaypkg.EnsureRuntimeDirs(); err != nil {
 		log.Printf("[!] gateway init dirs error: %v", err)
@@ -674,7 +657,6 @@ func runServe(args []string) error {
 	}
 
 	go dispatchLoop(dispatcher, dispatchCh, stopGateway, *skipDispatch)
-	go outboxLoop(dispatcher, stopGateway, *skipDispatch)
 	go mailLoop(config, db, dispatchCh, stopGateway)
 	if feishuEnabled {
 		go func() {
@@ -738,6 +720,12 @@ func runFeishuListMessages(args []string) error {
 	if !resp.Success() {
 		return fmt.Errorf("list messages failed: code=%d msg=%s", resp.Code, resp.Msg)
 	}
+	logDebugJSON("feishu.list_messages.response", map[string]any{
+		"chat_id":   strings.TrimSpace(*chatID),
+		"page_size": *pageSize,
+		"minutes":   *minutes,
+		"response":  resp,
+	})
 	if resp.Data == nil || len(resp.Data.Items) == 0 {
 		fmt.Println("no messages")
 		return nil
@@ -845,11 +833,29 @@ func runFeishuSend(args []string) error {
 	}
 
 	payload := provided[0]
+	logDebugJSON("feishu.send.invoke", map[string]any{
+		"message_id": strings.TrimSpace(*messageID),
+		"reply_type": payload.label,
+		"payload":    payload.payload,
+	})
 	dispatcher := &gatewaypkg.Dispatcher{FeishuClient: client}
 	replyMessageID, savedPath, err := dispatcher.SubmitReply(payload.actionType, *messageID, payload.payload)
 	if err != nil {
+		logDebugJSON("feishu.send.error", map[string]any{
+			"message_id": strings.TrimSpace(*messageID),
+			"reply_type": payload.label,
+			"payload":    payload.payload,
+			"error":      err.Error(),
+		})
 		return fmt.Errorf("send %s reply to Feishu message %s: %w", payload.label, strings.TrimSpace(*messageID), err)
 	}
+	logDebugJSON("feishu.send.result", map[string]any{
+		"message_id":       strings.TrimSpace(*messageID),
+		"reply_type":       payload.label,
+		"payload":          payload.payload,
+		"reply_message_id": replyMessageID,
+		"saved_path":       savedPath,
+	})
 
 	fmt.Printf("sent %s reply to message %s\n", payload.label, strings.TrimSpace(*messageID))
 	fmt.Printf("reply_message_id=%s\n", replyMessageID)
@@ -914,13 +920,25 @@ func runFeishu(args []string) error {
 
 func usage() string {
 	return strings.TrimSpace(`Usage:
-  glaw serve [--skip-dispatch] [--agent-cmd <command-prefix>]
-  glaw feishu list-messages -chat-id <chat_id> [-page-size 20] [-minutes 120]
-  glaw feishu send -message-id <message_id> (-text <text> | -image <path> | -file <path>)`)
+  glaw [--debug-log-file <path>] serve [--skip-dispatch] [--agent-cmd <command-prefix>]
+  glaw [--debug-log-file <path>] feishu list-messages -chat-id <chat_id> [-page-size 20] [-minutes 120]
+  glaw [--debug-log-file <path>] feishu send -message-id <message_id> (-text <text> | -image <path> | -file <path>)`)
 }
 
 func main() {
-	args := os.Args[1:]
+	fs := flag.NewFlagSet("glaw", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	debugLogFile := fs.String("debug-log-file", "", "append debug logs to this file")
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		os.Exit(2)
+	}
+	if err := configureDebugLogging(*debugLogFile); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	args := fs.Args()
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, usage())
 		os.Exit(2)
@@ -943,4 +961,60 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func configureDebugLogging(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+
+	resolvedPath, err := expandUserPath(path)
+	if err != nil {
+		return fmt.Errorf("resolve --debug-log-file: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(resolvedPath), 0755); err != nil {
+		return fmt.Errorf("create debug log dir: %w", err)
+	}
+
+	f, err := os.OpenFile(resolvedPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("open debug log file %s: %w", resolvedPath, err)
+	}
+
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	debugLogger = log.New(f, "", log.LstdFlags)
+	debugLogWriter = f
+	gatewaypkg.SetDebugLogWriter(f)
+	log.Printf("[debug] logging enabled at %s", filepath.ToSlash(resolvedPath))
+	return nil
+}
+
+func expandUserPath(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	if path == "~" {
+		return os.UserHomeDir()
+	}
+	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
+}
+
+func logDebugJSON(label string, value any) {
+	if debugLogger == nil {
+		return
+	}
+	body, err := json.Marshal(value)
+	if err != nil {
+		debugLogger.Printf("%s marshal_error=%v", label, err)
+		return
+	}
+	debugLogger.Printf("%s %s", label, string(body))
 }

@@ -1,6 +1,7 @@
 param(
     [string]$RunDir = (Get-Location).Path,
-    [string]$AgentCmd = ""
+    [string]$AgentCmd = "",
+    [string]$DebugLogFile = "~/logs/glaw-debug.log"
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +42,9 @@ Push-Location $RunDir
 try {
     Write-Host "[dev] starting glaw.exe serve in $RunDir ..."
     $ServeArgs = @("serve")
+    if ($DebugLogFile.Trim() -ne "") {
+        $ServeArgs = @("--debug-log-file", $DebugLogFile) + $ServeArgs
+    }
     if ($AgentCmd.Trim() -ne "") {
         $ServeArgs += @("--agent-cmd", $AgentCmd)
     }
