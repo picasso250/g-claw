@@ -52,6 +52,11 @@ type feishuFileContent struct {
 
 var feishuEventLogMu sync.Mutex
 
+const (
+	feishuUserCacheTTL      = 24 * time.Hour
+	feishuUserCacheMaxStale = 7 * 24 * time.Hour
+)
+
 func StartFeishuLongConn(config FeishuConfig, db *sql.DB, dispatchCh chan DispatchRequest) error {
 	if !config.Enable {
 		return nil
@@ -131,10 +136,17 @@ func handleFeishuEvent(client *lark.Client, config FeishuConfig, db *sql.DB, dis
 		return fmt.Errorf("parse message content for %s: %w", messageID, err)
 	}
 
+	senderDisplayName := senderOpenID
+	if resolvedName, err := resolveFeishuSenderDisplayName(client, db, chatID, senderOpenID); err != nil {
+		log.Printf("[feishu] [!] Resolve sender display name for %s failed: %v", senderOpenID, err)
+	} else if strings.TrimSpace(resolvedName) != "" {
+		senderDisplayName = resolvedName
+	}
+
 	msgTime := parseFeishuTime(derefString(message.CreateTime))
 	archiveContent := BuildMessageArchiveContent(ArchivedMessage{
 		Source:         "feishu",
-		SenderName:     senderType,
+		SenderName:     senderDisplayName,
 		SenderID:       senderOpenID,
 		ConversationID: chatID,
 		Subject:        chatType,
@@ -445,6 +457,92 @@ func formatFeishuMentions(mentions []*larkim.MentionEvent) []string {
 	return results
 }
 
+func resolveFeishuSenderDisplayName(client *lark.Client, db *sql.DB, chatID, openID string) (string, error) {
+	chatID = strings.TrimSpace(chatID)
+	openID = strings.TrimSpace(openID)
+	if chatID == "" || openID == "" {
+		return "", nil
+	}
+
+	now := time.Now().UTC()
+	cached, err := LookupFeishuUserCache(db, chatID, openID)
+	if err == nil {
+		cacheAge := now.Sub(cached.RefreshedAtUTC)
+		if cacheAge <= feishuUserCacheTTL && strings.TrimSpace(cached.DisplayName) != "" {
+			return cached.DisplayName, nil
+		}
+	} else if err != sql.ErrNoRows {
+		log.Printf("[feishu] [!] Lookup sender cache for %s failed: %v", openID, err)
+	}
+
+	if client == nil {
+		if cached != nil && now.Sub(cached.RefreshedAtUTC) <= feishuUserCacheMaxStale {
+			return cached.DisplayName, nil
+		}
+		return "", fmt.Errorf("feishu client is nil")
+	}
+
+	pageToken := ""
+	for {
+		reqBuilder := larkim.NewGetChatMembersReqBuilder().
+			ChatId(chatID).
+			MemberIdType("open_id").
+			PageSize(100)
+		if pageToken != "" {
+			reqBuilder.PageToken(pageToken)
+		}
+
+		resp, err := client.Im.V1.ChatMembers.Get(context.Background(), reqBuilder.Build())
+		appendFeishuChatMembersRawLog(chatID, openID, pageToken, resp, err)
+		if err != nil {
+			if cached != nil && now.Sub(cached.RefreshedAtUTC) <= feishuUserCacheMaxStale && strings.TrimSpace(cached.DisplayName) != "" {
+				log.Printf("[feishu] [*] Using stale sender cache for %s in chat %s after lookup failure: %v", openID, chatID, err)
+				return cached.DisplayName, nil
+			}
+			return "", err
+		}
+		if resp == nil || !resp.Success() {
+			lookupErr := fmt.Errorf("code=%d msg=%s", resp.Code, resp.Msg)
+			if cached != nil && now.Sub(cached.RefreshedAtUTC) <= feishuUserCacheMaxStale && strings.TrimSpace(cached.DisplayName) != "" {
+				log.Printf("[feishu] [*] Using stale sender cache for %s in chat %s after lookup failure: %v", openID, chatID, lookupErr)
+				return cached.DisplayName, nil
+			}
+			return "", lookupErr
+		}
+		if resp.Data != nil {
+			for _, item := range resp.Data.Items {
+				if item == nil || strings.TrimSpace(derefString(item.MemberId)) != openID {
+					continue
+				}
+				displayName := strings.TrimSpace(derefString(item.Name))
+				if displayName == "" {
+					displayName = openID
+				}
+				entry := FeishuUserCacheEntry{
+					ChatID:         chatID,
+					OpenID:         openID,
+					DisplayName:    displayName,
+					RefreshedAtUTC: now,
+				}
+				if saveErr := SaveFeishuUserCache(db, entry); saveErr != nil {
+					log.Printf("[feishu] [!] Save sender cache for %s in chat %s failed: %v", openID, chatID, saveErr)
+				}
+				return displayName, nil
+			}
+			if resp.Data.HasMore != nil && *resp.Data.HasMore && resp.Data.PageToken != nil && strings.TrimSpace(*resp.Data.PageToken) != "" {
+				pageToken = strings.TrimSpace(*resp.Data.PageToken)
+				continue
+			}
+		}
+		break
+	}
+
+	if cached != nil && now.Sub(cached.RefreshedAtUTC) <= feishuUserCacheMaxStale && strings.TrimSpace(cached.DisplayName) != "" {
+		return cached.DisplayName, nil
+	}
+	return "", fmt.Errorf("member %s not found in chat %s", openID, chatID)
+}
+
 func derefString(value *string) string {
 	if value == nil {
 		return ""
@@ -501,4 +599,46 @@ func appendFeishuEventRawLog(event *larkim.P2MessageReceiveV1) {
 	if _, err := f.Write(append(body, '\n')); err != nil {
 		log.Printf("[feishu] [!] write raw event log failed: %v", err)
 	}
+}
+
+func appendFeishuChatMembersRawLog(chatID, openID, pageToken string, resp *larkim.GetChatMembersResp, lookupErr error) {
+	feishuEventLogMu.Lock()
+	defer feishuEventLogMu.Unlock()
+
+	if err := os.MkdirAll(LogsDir, 0755); err != nil {
+		log.Printf("[feishu] [!] create log dir failed: %v", err)
+		return
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"ts":         time.Now().Format(time.RFC3339),
+		"chat_id":    chatID,
+		"open_id":    openID,
+		"page_token": pageToken,
+		"error":      errorString(lookupErr),
+		"response":   resp,
+	})
+	if err != nil {
+		log.Printf("[feishu] [!] marshal chat members raw response failed: %v", err)
+		return
+	}
+
+	logPath := filepath.Join(LogsDir, "feishu_chat_members_raw.jsonl")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("[feishu] [!] open chat members raw log failed: %v", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.Write(append(body, '\n')); err != nil {
+		log.Printf("[feishu] [!] write chat members raw log failed: %v", err)
+	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

@@ -1,5 +1,5 @@
-当前主程序已经统一为 `glaw`，`cmd/glaw/main.go` 同时承载 `serve` 和 `feishu list-messages` 子命令，旧的 `cmd/gateway`、`cmd/feishu-list-messages` 和 `cmd/debug-agent-cmd` 已删除并已推送到 `origin/main`。 
-配置加载机制目前已恢复为 key 级覆盖：先读 `~/.env`，再从当前运行目录一路向上读各级 `.env`，后加载覆盖先加载，并额外处理了首行 UTF-8 BOM，最近一次相关提交已经推送。 
-Agent 启动协议刚刚又简化了一次：`AGENT_PROMPT_ARG` 已删，`AGENT_CMD` 现在被当作“prompt 前面的完整命令前缀”，程序只会在最后追加 prompt 本身，因此 Gemini 应写成 `gemini --yolo -p`，opencode 应写成 `node ...\\opencode -m zhipuai-coding-plan/glm-5 run`；这一版代码已本地 `go build ./...` 通过，但尚未提交推送。 
-运行目录方面，`dev.ps1` 现支持 `-RunDir` 且默认取当前目录，`~/glaw-ds` 已创建并从 `~/my-claw` 复制了 `gateway/`、若干 `.md/.txt` 文件以及一个本地 `.env`，其中 `AGENT_CMD` 已改成 node 直启 opencode 的 `run` 形式。 
-下一步最合理的是先在 `~/glaw-ds` 下重新跑 `.\dev.ps1 -RunDir ~/glaw-ds` 验证 opencode 是否能正确吃到完整 prompt，如果正常再把这次“删除 AGENT_PROMPT_ARG 并简化 AGENT_CMD 约定”的改动提交并推送，然后再回头处理用户刚提到但尚未查看的 `https://termo.ai/skills/video-aroll-auto-editor` 技能前置条件问题。 
+当前目标已从“调查 Feishu 发送者昵称来源”收敛为“接受通过 `im/v1/chats/:chat_id/members` 获取 sender `name`，并承认它在当前群里仍可能不是用户实际看到的昵称，因为连飞书官方机器人也复现了这个现象”。
+已完成的关键实现是：Feishu 入站归档的 `SenderName` 不再使用 `contact/v3/users/:user_id`，而是改成调用 `im/v1/chats/:chat_id/members` 分页查找当前 `chat_id + sender_open_id` 对应成员名，并把缓存键切成 `chat_id + open_id`。 
+日志与缓存也已同步落地：新增 `logs/feishu_chat_members_raw.jsonl` 记录每次群成员接口原始响应，sqlite 中新增 `feishu_chat_user_cache(chat_id, open_id, display_name, refreshed_at_unix)`，TTL 为 24 小时，失败时允许回退到 7 天 stale 缓存。 
+当前代码状态是：`internal/gateway/feishu.go` 与 `internal/gateway/state.go` 已更新，期间修复过一次 `CREATE TABLE feishu_chat_user_cache` 少逗号导致的 `init db: SQL logic error: near \"(\": syntax error (1)`，并且 `gofmt` 与 `go build ./...` 已再次通过。 
+下一步最合理的动作是继续用真实群消息观察 `feishu_chat_members_raw.jsonl` 与归档输出，如果确认该接口长期只能返回错误名字，就把这件事正式记录为飞书侧限制/疑似 bug，并避免再为“真实群昵称”追加高风险推断逻辑。 
