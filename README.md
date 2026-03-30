@@ -52,6 +52,14 @@ Use a custom scheduler config file:
 go run ./cmd/glaw serve --cron-config .\cron.json
 ```
 
+Inspect configured scheduler tasks:
+
+```powershell
+go run ./cmd/glaw cron list --cron-config .\cron.json
+go run ./cmd/glaw cron check --cron-config .\cron.json
+go run ./cmd/glaw cron run --cron-config .\cron.json -name "daily-summary"
+```
+
 Temporarily override the assistant runner for one `serve` process:
 
 ```powershell
@@ -112,6 +120,13 @@ Supported task types:
 
 - `program` or empty `type`: execute `command` plus `args`
 - `ai`: enqueue `prompt` into the existing `dispatchCh`, so scheduled AI work stays inside the same serialized dispatch path as email and Feishu
+
+Manual cron helpers:
+
+- `glaw cron list`: print the current parsed task list
+- `glaw cron check`: show which tasks are due at `now` or at `--at <RFC3339>`
+- `glaw cron run -name <task-name>`: run one task immediately
+- `glaw cron run --all-due`: run only the tasks due at `now` or at `--at <RFC3339>`
 
 Example `./cron.json`:
 

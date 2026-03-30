@@ -11,8 +11,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -857,9 +859,271 @@ func runFeishu(args []string) error {
 	}
 }
 
+func runCronList(args []string) error {
+	fs := flag.NewFlagSet("cron list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	cronConfig := fs.String("cron-config", gatewaypkg.DefaultCronConfigPath, "path to scheduler config JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments for cron list: %s", strings.Join(fs.Args(), " "))
+	}
+
+	tasks, err := gatewaypkg.LoadScheduledTasks(*cronConfig)
+	if err != nil {
+		return fmt.Errorf("load cron config: %w", err)
+	}
+	if len(tasks) == 0 {
+		fmt.Println("no scheduled tasks")
+		return nil
+	}
+
+	for i, task := range tasks {
+		fmt.Printf("[%d] name=%s enabled=%t type=%s schedule=%s\n", i, task.DisplayName(i), task.IsEnabled(), task.NormalizedType(), task.NormalizedSchedule())
+		if len(task.Hours) > 0 {
+			fmt.Printf("hours=%v\n", task.Hours)
+		}
+		if strings.TrimSpace(task.Command) != "" {
+			fmt.Printf("command=%s\n", task.Command)
+		}
+		if len(task.Args) > 0 {
+			fmt.Printf("args=%q\n", task.Args)
+		}
+		if strings.TrimSpace(task.Prompt) != "" {
+			fmt.Printf("prompt=%s\n", task.Prompt)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func runCronCheck(args []string) error {
+	fs := flag.NewFlagSet("cron check", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	cronConfig := fs.String("cron-config", gatewaypkg.DefaultCronConfigPath, "path to scheduler config JSON")
+	at := fs.String("at", "", "check due tasks at RFC3339 time, default now")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments for cron check: %s", strings.Join(fs.Args(), " "))
+	}
+
+	now := time.Now()
+	if strings.TrimSpace(*at) != "" {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*at))
+		if err != nil {
+			return fmt.Errorf("parse -at: %w", err)
+		}
+		now = parsed
+	}
+
+	tasks, err := gatewaypkg.LoadScheduledTasks(*cronConfig)
+	if err != nil {
+		return fmt.Errorf("load cron config: %w", err)
+	}
+
+	fmt.Printf("check_time=%s\n", now.Format(time.RFC3339))
+	found := false
+	for i, task := range tasks {
+		slot, due, err := task.RunSlot(now)
+		if err != nil {
+			fmt.Printf("[%d] name=%s invalid: %v\n", i, task.DisplayName(i), err)
+			continue
+		}
+		fmt.Printf("[%d] name=%s enabled=%t due=%t", i, task.DisplayName(i), task.IsEnabled(), task.IsEnabled() && due)
+		if slot != "" {
+			fmt.Printf(" slot=%s", slot)
+		}
+		fmt.Println()
+		if task.IsEnabled() && due {
+			found = true
+		}
+	}
+	if !found {
+		fmt.Println("no due tasks")
+	}
+	return nil
+}
+
+func runCronTask(task gatewaypkg.ScheduledTask, index int, dispatcher *gatewaypkg.Dispatcher) error {
+	switch task.NormalizedType() {
+	case "program":
+		command := strings.TrimSpace(task.Command)
+		if command == "" {
+			return fmt.Errorf("task %s requires command", task.DisplayName(index))
+		}
+		resolvedCommand := gatewaypkg.ResolveScheduledCommand(command)
+		cmd := exec.Command(resolvedCommand, task.Args...)
+		if workDir := strings.TrimSpace(task.WorkDir); workDir != "" {
+			cmd.Dir = workDir
+		}
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		fmt.Printf("[cron] [EXEC] %s (%s %v)\n", task.DisplayName(index), resolvedCommand, task.Args)
+		return cmd.Run()
+	case "ai":
+		prompt := strings.TrimSpace(task.Prompt)
+		if prompt == "" {
+			return fmt.Errorf("task %s requires prompt", task.DisplayName(index))
+		}
+		fmt.Printf("[cron] [QUEUE] %s -> dispatch\n", task.DisplayName(index))
+		if dispatcher == nil {
+			return fmt.Errorf("dispatcher is required for ai task %s", task.DisplayName(index))
+		}
+		if !dispatcher.DispatchBatch([]gatewaypkg.DispatchRequest{{Type: "ai", Message: prompt}}) {
+			return fmt.Errorf("dispatch failed for ai task %s", task.DisplayName(index))
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported task type %q", task.Type)
+	}
+}
+
+func selectCronTasks(tasks []gatewaypkg.ScheduledTask, name string, allDue bool, now time.Time) ([]int, error) {
+	if strings.TrimSpace(name) != "" {
+		var selected []int
+		for i, task := range tasks {
+			if strings.EqualFold(task.DisplayName(i), strings.TrimSpace(name)) {
+				selected = append(selected, i)
+			}
+		}
+		if len(selected) == 0 {
+			return nil, fmt.Errorf("task %q not found", name)
+		}
+		return selected, nil
+	}
+
+	if allDue {
+		var selected []int
+		for i, task := range tasks {
+			if !task.IsEnabled() {
+				continue
+			}
+			_, due, err := task.RunSlot(now)
+			if err != nil {
+				continue
+			}
+			if due {
+				selected = append(selected, i)
+			}
+		}
+		return selected, nil
+	}
+
+	var selected []int
+	for i := range tasks {
+		selected = append(selected, i)
+	}
+	return selected, nil
+}
+
+func newDispatcherFromEnv() (*gatewaypkg.Dispatcher, error) {
+	cfg, err := loadEnv()
+	if err != nil {
+		return nil, fmt.Errorf("load .env: %w", err)
+	}
+
+	feishuEnabled := strings.TrimSpace(cfg.Feishu.AppID) != "" && strings.TrimSpace(cfg.Feishu.AppSecret) != ""
+	var feishuClient *lark.Client
+	if feishuEnabled {
+		feishuClient = lark.NewClient(cfg.Feishu.AppID, cfg.Feishu.AppSecret)
+	}
+	return &gatewaypkg.Dispatcher{
+		AgentCmd:     cfg.AgentCmd,
+		FeishuClient: feishuClient,
+	}, nil
+}
+
+func runCronRun(args []string) error {
+	fs := flag.NewFlagSet("cron run", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	cronConfig := fs.String("cron-config", gatewaypkg.DefaultCronConfigPath, "path to scheduler config JSON")
+	name := fs.String("name", "", "run one task by name")
+	allDue := fs.Bool("all-due", false, "run only tasks due right now")
+	at := fs.String("at", "", "used with -all-due, check due tasks at RFC3339 time")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments for cron run: %s", strings.Join(fs.Args(), " "))
+	}
+	if strings.TrimSpace(*name) != "" && *allDue {
+		return fmt.Errorf("use only one of -name or -all-due")
+	}
+
+	now := time.Now()
+	if strings.TrimSpace(*at) != "" {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*at))
+		if err != nil {
+			return fmt.Errorf("parse -at: %w", err)
+		}
+		now = parsed
+	}
+
+	tasks, err := gatewaypkg.LoadScheduledTasks(*cronConfig)
+	if err != nil {
+		return fmt.Errorf("load cron config: %w", err)
+	}
+
+	selected, err := selectCronTasks(tasks, *name, *allDue, now)
+	if err != nil {
+		return err
+	}
+	if len(selected) == 0 {
+		return fmt.Errorf("no tasks selected")
+	}
+	slices.Sort(selected)
+
+	needsDispatcher := false
+	for _, i := range selected {
+		if tasks[i].NormalizedType() == "ai" {
+			needsDispatcher = true
+			break
+		}
+	}
+
+	var dispatcher *gatewaypkg.Dispatcher
+	if needsDispatcher {
+		dispatcher, err = newDispatcherFromEnv()
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, i := range selected {
+		task := tasks[i]
+		if err := runCronTask(task, i, dispatcher); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runCron(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("missing cron subcommand")
+	}
+
+	switch args[0] {
+	case "list":
+		return runCronList(args[1:])
+	case "check":
+		return runCronCheck(args[1:])
+	case "run":
+		return runCronRun(args[1:])
+	default:
+		return fmt.Errorf("unknown cron subcommand %q", args[0])
+	}
+}
+
 func usage() string {
 	return strings.TrimSpace(`Usage:
   glaw serve [--agent-cmd <command-prefix>] [--cron-config <path>]
+  glaw cron list [--cron-config <path>]
+  glaw cron check [--cron-config <path>] [--at <rfc3339>]
+  glaw cron run [--cron-config <path>] [-name <task-name> | --all-due] [--at <rfc3339>]
   glaw feishu list-messages -chat-id <chat_id> [-page-size 20] [-minutes 120]
   glaw feishu send -message-id <message_id> (-text <text> | -image <path> | -file <path>)`)
 }
@@ -875,6 +1139,8 @@ func main() {
 	switch args[0] {
 	case "serve":
 		err = runServe(args[1:])
+	case "cron":
+		err = runCron(args[1:])
 	case "feishu":
 		err = runFeishu(args[1:])
 	case "-h", "--help", "help":

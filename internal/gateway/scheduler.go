@@ -112,6 +112,14 @@ func loadScheduledTasks(configPath string) ([]ScheduledTask, error) {
 	return tasks, nil
 }
 
+func LoadScheduledTasks(configPath string) ([]ScheduledTask, error) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		configPath = DefaultCronConfigPath
+	}
+	return loadScheduledTasks(configPath)
+}
+
 func (t ScheduledTask) isEnabled() bool {
 	return t.Enabled == nil || *t.Enabled
 }
@@ -128,7 +136,12 @@ func (t ScheduledTask) normalizedType() string {
 }
 
 func (t ScheduledTask) normalizedSchedule() string {
-	return strings.ToLower(strings.TrimSpace(t.Schedule))
+	switch strings.ToLower(strings.TrimSpace(t.Schedule)) {
+	case "":
+		return "hourly"
+	default:
+		return strings.ToLower(strings.TrimSpace(t.Schedule))
+	}
 }
 
 func (t ScheduledTask) displayName(index int) string {
@@ -146,15 +159,33 @@ func (t ScheduledTask) key(index int) string {
 	return fmt.Sprintf("task-%d", index)
 }
 
-func (t ScheduledTask) runSlot(now time.Time) (string, bool, error) {
-	if now.Minute() != 0 {
-		return "", false, nil
-	}
+func (t ScheduledTask) DisplayName(index int) string {
+	return t.displayName(index)
+}
 
+func (t ScheduledTask) IsEnabled() bool {
+	return t.isEnabled()
+}
+
+func (t ScheduledTask) NormalizedType() string {
+	return t.normalizedType()
+}
+
+func (t ScheduledTask) NormalizedSchedule() string {
+	return t.normalizedSchedule()
+}
+
+func (t ScheduledTask) runSlot(now time.Time) (string, bool, error) {
 	switch t.normalizedSchedule() {
 	case "hourly":
+		if now.Minute() != 0 {
+			return "", false, nil
+		}
 		return now.Format("2006-01-02T15"), true, nil
 	case "daily":
+		if now.Minute() != 0 {
+			return "", false, nil
+		}
 		hours, err := t.validatedHours()
 		if err != nil {
 			return "", false, err
@@ -166,6 +197,10 @@ func (t ScheduledTask) runSlot(now time.Time) (string, bool, error) {
 	default:
 		return "", false, fmt.Errorf("unsupported schedule %q", t.Schedule)
 	}
+}
+
+func (t ScheduledTask) RunSlot(now time.Time) (string, bool, error) {
+	return t.runSlot(now)
 }
 
 func (t ScheduledTask) validatedHours() ([]int, error) {
@@ -251,4 +286,8 @@ func resolveScheduledCommand(command string) string {
 		return "py"
 	}
 	return command
+}
+
+func ResolveScheduledCommand(command string) string {
+	return resolveScheduledCommand(command)
 }
