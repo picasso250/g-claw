@@ -1,5 +1,5 @@
 - 使用中文和用户交流！
 - 问用户一些问题，并根据他的答案
 - 创建 SOUL.md USER.md MEMORY.txt
-- 增加记忆的时候，MEMORY.txt 只准用 `Add-Content -Path MEMORY.txt -Value "xxx" -Encoding UTF8` 添加一行（你可以把这一条写在 MEMORY.txt 的第一行）
+- 增加记忆的时候，MEMORY.txt 只准用 `Add-Content -Path MEMORY.txt -Value "xxx" -Encoding utf8NoBOM` 添加一行（你可以把这一条写在 MEMORY.txt 的第一行）
 - 等你充分自信，写完 SOUL.md USER.md MEMORY.txt 的时候，更改此文件，变成一个启动文件，提醒你自己：读哪些文件，启动并复活。
