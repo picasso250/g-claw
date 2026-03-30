@@ -26,6 +26,8 @@ if ([string]::IsNullOrWhiteSpace($env:EXECUTOR_TOKEN)) {
     throw "EXECUTOR_TOKEN is empty"
 }
 
+$pidLine = "PID: $PID"
+
 @(
     "StartedAt: $(Get-Date -Format o)"
     "PWD: $((Get-Location).Path)"
@@ -33,22 +35,13 @@ if ([string]::IsNullOrWhiteSpace($env:EXECUTOR_TOKEN)) {
     "WorkerURL: $WorkerUrl"
     "AgentId: $AgentId"
     "RuntimeLog: $RuntimeLogPath"
+    $pidLine
 ) | Set-Content -LiteralPath $StartLogPath -Encoding UTF8
 
-$command = @"
-`$env:EXECUTOR_TOKEN = '$env:EXECUTOR_TOKEN'
-Set-Location '$RunDir'
-Write-Host '===== claw-executor start ====='
-Get-Content -LiteralPath '$StartLogPath'
-Write-Host ''
-Write-Host '===== claw-executor runtime ====='
-python '$ExecutorScript' --worker-url '$WorkerUrl' --agent-id '$AgentId' 2>&1 | Tee-Object -FilePath '$RuntimeLogPath' -Append
-"@
+Write-Host "===== claw-executor start ====="
+Get-Content -LiteralPath $StartLogPath
+Write-Host ""
+Write-Host "===== claw-executor runtime ====="
+python $ExecutorScript --worker-url $WorkerUrl --agent-id $AgentId 2>&1 | Tee-Object -FilePath $RuntimeLogPath -Append
 
-$proc = Start-Process -FilePath "pwsh" -ArgumentList @("-NoLogo", "-NoExit", "-Command", $command) -WorkingDirectory $RunDir -PassThru
-
-$startLines = Get-Content -LiteralPath $StartLogPath
-@($startLines + "PID: $($proc.Id)") | Set-Content -LiteralPath $StartLogPath -Encoding UTF8
-
-Write-Host "claw-executor started (PID: $($proc.Id))"
 Write-Host "start log: $StartLogPath"
