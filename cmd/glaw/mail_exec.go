@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	multipart "mime/multipart"
 	stdmail "net/mail"
@@ -162,6 +163,7 @@ func sendMailWithAttachments(config Config, toAddr, subject, body string, attach
 	if err != nil {
 		return err
 	}
+	log.Printf("[mail_exec] [*] Sending reply mail to=%s smtp=%s:%d attachments=%d", toAddr, server, port, len(attachmentPaths))
 	payload, err := buildMailWithAttachments(config.MailUser, toAddr, subject, body, attachmentPaths)
 	if err != nil {
 		return err
@@ -198,7 +200,11 @@ func sendMailWithAttachments(config Config, toAddr, subject, body string, attach
 		wc.Close()
 		return err
 	}
-	return wc.Close()
+	if err := wc.Close(); err != nil {
+		return err
+	}
+	log.Printf("[mail_exec] [*] Reply mail sent to=%s", toAddr)
+	return nil
 }
 
 func buildExecutionResultPaths(baseDir string, uid uint32, sender string, now time.Time) (string, string) {
@@ -236,16 +242,20 @@ func executeMailAttachment(scriptPath string) (string, string, error) {
 	defer cancel()
 
 	var cmd *exec.Cmd
+	runner := ""
 	switch strings.ToLower(filepath.Ext(scriptPath)) {
 	case ".ps1":
 		cmd = exec.CommandContext(ctx, "pwsh", "-File", scriptPath)
+		runner = "pwsh"
 	case ".py":
 		cmd = exec.CommandContext(ctx, "python", scriptPath)
+		runner = "python"
 	default:
 		return "", "", fmt.Errorf("unsupported attachment type %q", filepath.Ext(scriptPath))
 	}
 
 	cmd.Dir = filepath.Dir(scriptPath)
+	log.Printf("[mail_exec] [*] Executing attachment via %s: %s", runner, scriptPath)
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -256,7 +266,13 @@ func executeMailAttachment(scriptPath string) (string, string, error) {
 			stderrBuf.WriteString("\n")
 		}
 		stderrBuf.WriteString("TIMEOUT")
+		log.Printf("[mail_exec] [!] Attachment timed out after %s: %s", mailExecTimeout, scriptPath)
 		return stdoutBuf.String(), stderrBuf.String(), fmt.Errorf("attachment execution timed out after %s", mailExecTimeout)
+	}
+	if err != nil {
+		log.Printf("[mail_exec] [!] Attachment execution failed: %s err=%v", scriptPath, err)
+	} else {
+		log.Printf("[mail_exec] [*] Attachment execution finished: %s", scriptPath)
 	}
 	return stdoutBuf.String(), stderrBuf.String(), err
 }
@@ -267,6 +283,7 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 		return err
 	}
 	defer os.RemoveAll(tempDir)
+	log.Printf("[mail_exec] [*] Created temp dir for uid=%d: %s", uid, tempDir)
 
 	stdoutPath, stderrPath := buildExecutionResultPaths(tempDir, uid, sender, time.Now())
 	stdout := ""
@@ -274,12 +291,16 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 
 	scriptPath, err := selectExecutableAttachment(archivedEmail.Attachments)
 	if err != nil {
+		log.Printf("[mail_exec] [!] Attachment selection failed for uid=%d: %v", uid, err)
 		stderr = err.Error() + "\n"
 	} else {
+		log.Printf("[mail_exec] [*] Selected attachment for uid=%d: %s", uid, scriptPath)
 		tempScriptPath := filepath.Join(tempDir, filepath.Base(scriptPath))
 		if err := copyFile(scriptPath, tempScriptPath); err != nil {
+			log.Printf("[mail_exec] [!] Copy attachment failed for uid=%d: %v", uid, err)
 			stderr = err.Error() + "\n"
 		} else {
+			log.Printf("[mail_exec] [*] Copied attachment for uid=%d to: %s", uid, tempScriptPath)
 			stdout, stderr, err = executeMailAttachment(tempScriptPath)
 		}
 		if err != nil {
@@ -297,6 +318,7 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 	if err := os.WriteFile(stderrPath, []byte(stderr), 0644); err != nil {
 		return err
 	}
+	log.Printf("[mail_exec] [*] Wrote execution result files for uid=%d stdout=%s stderr=%s", uid, stdoutPath, stderrPath)
 
 	return sendMailWithAttachments(
 		*config,
