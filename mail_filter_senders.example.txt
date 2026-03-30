@@ -1,0 +1,5 @@
+# One sender per line.
+# Blank lines and # comments are ignored.
+
+trusted-user@example.com
+another-user@example.com

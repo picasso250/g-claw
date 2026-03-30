@@ -29,7 +29,6 @@ func buildBatchPrompt(absInit string, emailPaths, feishuMessages, aiPrompts []st
 %s
 ===
 - 这些任务来自 gateway 内部 scheduler，已经通过同一个 dispatch 串行入口进入当前会话。
-- 如果需要回复飞书，请直接运行 ~/bin/glaw.exe feishu send。
 `, absInit, strings.Join(aiPrompts, "\n===\n"))
 	default:
 		return fmt.Sprintf(`读 %s 并处理当前批次消息。

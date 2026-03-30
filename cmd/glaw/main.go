@@ -34,9 +34,13 @@ type Config struct {
 	MailPass       string
 	MailImapServer string
 	FilterSenders  []string
+	FilterListPath string
 	AgentCmd       string
+	EnvPath        string
 	Feishu         gatewaypkg.FeishuConfig
 }
+
+const defaultMailFilterListName = "mail_filter_senders.txt"
 
 func filenameFromContentType(contentType string) string {
 	switch contentType {
@@ -99,6 +103,21 @@ func parseFilterSenders(val string) []string {
 	return filters
 }
 
+func parseFilterSenderLines(lines []string) []string {
+	var filters []string
+	for _, line := range lines {
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.ToLower(strings.TrimSpace(line))
+		if line == "" {
+			continue
+		}
+		filters = append(filters, line)
+	}
+	return filters
+}
+
 func parseCSV(val string) []string {
 	var items []string
 	for _, s := range strings.Split(val, ",") {
@@ -156,8 +175,24 @@ func findEnvFiles() ([]string, error) {
 	return envFiles, nil
 }
 
-func loadEnvValues() (map[string]string, error) {
-	envPaths, err := findEnvFiles()
+func resolveEnvPaths(envPath string) ([]string, error) {
+	envPath = strings.TrimSpace(envPath)
+	if envPath == "" || strings.EqualFold(envPath, "auto") {
+		return findEnvFiles()
+	}
+
+	info, err := os.Stat(envPath)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("env path is a directory: %s", envPath)
+	}
+	return []string{envPath}, nil
+}
+
+func loadEnvValues(envPath string) (map[string]string, error) {
+	envPaths, err := resolveEnvPaths(envPath)
 	if err != nil {
 		return nil, err
 	}
@@ -191,11 +226,12 @@ func loadEnvValues() (map[string]string, error) {
 	return values, nil
 }
 
-func loadEnv() (Config, error) {
+func loadEnv(envPath string) (Config, error) {
 	config := Config{
 		MailImapServer: "imap.163.com",
+		EnvPath:        strings.TrimSpace(envPath),
 	}
-	values, err := loadEnvValues()
+	values, err := loadEnvValues(envPath)
 	if err != nil {
 		return config, err
 	}
@@ -208,9 +244,6 @@ func loadEnv() (Config, error) {
 	}
 	if val, ok := values["MAIL_IMAP_SERVER"]; ok {
 		config.MailImapServer = val
-	}
-	if val, ok := values["MAIL_FILTER_SENDER"]; ok {
-		config.FilterSenders = parseFilterSenders(val)
 	}
 	if val, ok := values["AGENT_CMD"]; ok {
 		config.AgentCmd = val
@@ -231,17 +264,53 @@ func loadEnv() (Config, error) {
 	return config, nil
 }
 
-func reloadFilterSendersFromEnv() ([]string, error) {
-	values, err := loadEnvValues()
-	if err != nil {
-		return nil, err
+func resolveFilterListPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return defaultMailFilterListName, nil
 	}
 
-	val, ok := values["MAIL_FILTER_SENDER"]
-	if !ok {
-		return []string{}, nil
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if strings.HasSuffix(path, `\`) || strings.HasSuffix(path, `/`) {
+				return filepath.Join(path, defaultMailFilterListName), nil
+			}
+			return path, nil
+		}
+		return "", err
 	}
-	return parseFilterSenders(val), nil
+	if info.IsDir() {
+		return filepath.Join(path, defaultMailFilterListName), nil
+	}
+	return path, nil
+}
+
+func loadFilterSendersFromFile(path string) ([]string, string, error) {
+	resolvedPath, err := resolveFilterListPath(path)
+	if err != nil {
+		return nil, "", err
+	}
+
+	f, err := os.Open(resolvedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, resolvedPath, nil
+		}
+		return nil, "", err
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, "", err
+	}
+
+	return parseFilterSenderLines(lines), resolvedPath, nil
 }
 
 func signalDispatch(dispatchCh chan gatewaypkg.DispatchRequest, req gatewaypkg.DispatchRequest) {
@@ -280,10 +349,11 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB, dispatc
 		return nil
 	}
 
-	if filters, err := reloadFilterSendersFromEnv(); err != nil {
-		log.Printf("[check_mail] [!] Reload MAIL_FILTER_SENDER from .env failed: %v (keeping previous filter)", err)
+	if filters, resolvedPath, err := loadFilterSendersFromFile(config.FilterListPath); err != nil {
+		log.Printf("[check_mail] [!] Reload mail filter list failed: %v (keeping previous filter)", err)
 	} else {
 		config.FilterSenders = filters
+		config.FilterListPath = resolvedPath
 	}
 
 	_, err := c.Select("INBOX", false)
@@ -570,6 +640,10 @@ func runServe(args []string) error {
 	fs.SetOutput(os.Stderr)
 	agentCmd := fs.String("agent-cmd", "", "override AGENT_CMD from .env for this serve process")
 	cronConfig := fs.String("cron-config", gatewaypkg.DefaultCronConfigPath, "path to scheduler config JSON")
+	filterList := fs.String("mail-filter", defaultMailFilterListName, "mail sender allowlist file path, or a directory containing that file")
+	envPath := fs.String("env", "auto", "env file path, or 'auto' to use upward lookup")
+	dryRun := fs.Bool("dry-run", false, "load and print effective configuration, then exit without starting services")
+	runPrompt := fs.String("run-prompt", "", "run one prompt with the configured agent command, then exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -581,14 +655,41 @@ func runServe(args []string) error {
 		return fmt.Errorf("current working directory must be glaw root: missing gateway/")
 	}
 
-	config, err := loadEnv()
+	config, err := loadEnv(*envPath)
 	if err != nil {
 		return fmt.Errorf("load .env: %w", err)
 	}
 	if strings.TrimSpace(*agentCmd) != "" {
 		config.AgentCmd = *agentCmd
 	}
+	filters, resolvedFilterPath, err := loadFilterSendersFromFile(*filterList)
+	if err != nil {
+		return fmt.Errorf("load mail filter list: %w", err)
+	}
+	config.FilterSenders = filters
+	config.FilterListPath = resolvedFilterPath
 	log.Printf("[serve] FilterSenders=%q", config.FilterSenders)
+	log.Printf("[serve] FilterListPath=%s", config.FilterListPath)
+	log.Printf("[serve] EnvPath=%s", strings.TrimSpace(*envPath))
+	log.Printf("[serve] CronConfig=%s", strings.TrimSpace(*cronConfig))
+	log.Printf("[serve] AgentCmd=%s", config.AgentCmd)
+
+	feishuEnabled := strings.TrimSpace(config.Feishu.AppID) != "" && strings.TrimSpace(config.Feishu.AppSecret) != ""
+	config.Feishu.Enable = feishuEnabled
+	log.Printf("[serve] FeishuEnabled=%t", feishuEnabled)
+
+	if *dryRun {
+		log.Printf("[serve] DryRun=true")
+		return nil
+	}
+	if strings.TrimSpace(*runPrompt) != "" {
+		log.Printf("[serve] RunPrompt=true")
+		dispatcher := &gatewaypkg.Dispatcher{AgentCmd: config.AgentCmd}
+		if !dispatcher.DispatchBatch([]gatewaypkg.DispatchRequest{{Type: "ai", Message: strings.TrimSpace(*runPrompt)}}) {
+			return fmt.Errorf("run prompt failed")
+		}
+		return nil
+	}
 
 	db, err := gatewaypkg.InitDB()
 	if err != nil {
@@ -603,9 +704,6 @@ func runServe(args []string) error {
 	dispatchCh := make(chan gatewaypkg.DispatchRequest, 100)
 
 	fmt.Println(">>> Gateway starting (check-mail + dispatch)...")
-
-	feishuEnabled := strings.TrimSpace(config.Feishu.AppID) != "" && strings.TrimSpace(config.Feishu.AppSecret) != ""
-	config.Feishu.Enable = feishuEnabled
 
 	var feishuClient *lark.Client
 	if feishuEnabled {
@@ -641,6 +739,7 @@ func runFeishuListMessages(args []string) error {
 	chatID := fs.String("chat-id", "", "Feishu chat_id, e.g. oc_xxx")
 	pageSize := fs.Int("page-size", 20, "number of messages to fetch")
 	minutes := fs.Int("minutes", 120, "look back this many minutes")
+	envPath := fs.String("env", "auto", "env file path, or 'auto' to use upward lookup")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -651,7 +750,7 @@ func runFeishuListMessages(args []string) error {
 		return fmt.Errorf("missing -chat-id")
 	}
 
-	cfg, err := loadEnv()
+	cfg, err := loadEnv(*envPath)
 	if err != nil {
 		return fmt.Errorf("load .env: %w", err)
 	}
@@ -732,8 +831,8 @@ func saveFeishuListMessagesSnapshot(content string) (string, error) {
 	return path, nil
 }
 
-func newFeishuClientFromEnv() (*lark.Client, error) {
-	cfg, err := loadEnv()
+func newFeishuClientFromEnv(envPath string) (*lark.Client, error) {
+	cfg, err := loadEnv(envPath)
 	if err != nil {
 		return nil, fmt.Errorf("load .env: %w", err)
 	}
@@ -750,6 +849,7 @@ func runFeishuSend(args []string) error {
 	text := fs.String("text", "", "short text reply")
 	image := fs.String("image", "", "local image path to reply with")
 	file := fs.String("file", "", "local file path to reply with")
+	envPath := fs.String("env", "auto", "env file path, or 'auto' to use upward lookup")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -783,7 +883,7 @@ func runFeishuSend(args []string) error {
 		return fmt.Errorf("only one of -text, -image, -file may be used at a time")
 	}
 
-	client, err := newFeishuClientFromEnv()
+	client, err := newFeishuClientFromEnv(*envPath)
 	if err != nil {
 		return err
 	}
@@ -1019,8 +1119,8 @@ func selectCronTasks(tasks []gatewaypkg.ScheduledTask, name string, allDue bool,
 	return selected, nil
 }
 
-func newDispatcherFromEnv() (*gatewaypkg.Dispatcher, error) {
-	cfg, err := loadEnv()
+func newDispatcherFromEnv(envPath string) (*gatewaypkg.Dispatcher, error) {
+	cfg, err := loadEnv(envPath)
 	if err != nil {
 		return nil, fmt.Errorf("load .env: %w", err)
 	}
@@ -1043,6 +1143,7 @@ func runCronRun(args []string) error {
 	name := fs.String("name", "", "run one task by name")
 	allDue := fs.Bool("all-due", false, "run only tasks due right now")
 	at := fs.String("at", "", "used with -all-due, check due tasks at RFC3339 time")
+	envPath := fs.String("env", "auto", "env file path, or 'auto' to use upward lookup")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1086,7 +1187,7 @@ func runCronRun(args []string) error {
 
 	var dispatcher *gatewaypkg.Dispatcher
 	if needsDispatcher {
-		dispatcher, err = newDispatcherFromEnv()
+		dispatcher, err = newDispatcherFromEnv(*envPath)
 		if err != nil {
 			return err
 		}
@@ -1120,12 +1221,12 @@ func runCron(args []string) error {
 
 func usage() string {
 	return strings.TrimSpace(`Usage:
-  glaw serve [--agent-cmd <command-prefix>] [--cron-config <path>]
+  glaw serve [--agent-cmd <command-prefix>] [--cron-config <path>] [--mail-filter <path-or-dir>] [--env <path|auto>] [--dry-run] [--run-prompt <text>]
   glaw cron list [--cron-config <path>]
   glaw cron check [--cron-config <path>] [--at <rfc3339>]
-  glaw cron run [--cron-config <path>] [-name <task-name> | --all-due] [--at <rfc3339>]
-  glaw feishu list-messages -chat-id <chat_id> [-page-size 20] [-minutes 120]
-  glaw feishu send -message-id <message_id> (-text <text> | -image <path> | -file <path>)`)
+  glaw cron run [--cron-config <path>] [-name <task-name> | --all-due] [--at <rfc3339>] [--env <path|auto>]
+  glaw feishu list-messages -chat-id <chat_id> [-page-size 20] [-minutes 120] [--env <path|auto>]
+  glaw feishu send -message-id <message_id> (-text <text> | -image <path> | -file <path>) [--env <path|auto>]`)
 }
 
 func main() {

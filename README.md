@@ -25,12 +25,13 @@ Copy `.env.example` to `.env` and fill in:
 - `MAIL_USER`: IMAP login address
 - `MAIL_PASS`: IMAP password or app password
 - `MAIL_IMAP_SERVER`: IMAP host, for example `imap.example.com`
-- `MAIL_FILTER_SENDER`: comma-separated trusted senders to process
 - `AGENT_CMD`: assistant command prefix to execute; the gateway appends the prompt as the final argument. For example `gemini --yolo -p` or `node ...\\opencode -m zhipuai-coding-plan/glm-5 run`
 - `FEISHU_APP_ID`: Feishu app ID for the bot-enabled custom app
 - `FEISHU_APP_SECRET`: Feishu app secret for the bot-enabled custom app
 - `FEISHU_ALLOWED_OPEN_IDS`: comma-separated trusted Feishu sender `open_id` values
 - `FEISHU_ALLOWED_CHAT_IDS`: comma-separated trusted Feishu chat IDs
+
+Mail sender allowlist is no longer stored in `.env`. Put it in `./mail_filter_senders.txt` instead, one sender per line. Blank lines and `#` comments are ignored. A starter example is included at `./mail_filter_senders.example.txt`.
 
 ## Run
 
@@ -44,6 +45,31 @@ Start:
 
 ```powershell
 go run ./cmd/glaw serve
+```
+
+Use a custom mail sender allowlist file or directory:
+
+```powershell
+go run ./cmd/glaw serve --mail-filter .\mail_filter_senders.txt
+go run ./cmd/glaw serve --mail-filter .\
+```
+
+Use a single explicit `.env` file instead of upward lookup:
+
+```powershell
+go run ./cmd/glaw serve --env .\.env
+```
+
+Print the final effective `serve` configuration without starting IMAP, Feishu, or scheduler:
+
+```powershell
+go run ./cmd/glaw serve --env .\.env --mail-filter .\mail_filter_senders.txt --cron-config .\cron.json --dry-run
+```
+
+Run one prompt through the configured `AGENT_CMD`, then exit without starting services:
+
+```powershell
+go run ./cmd/glaw serve --env .\.env --run-prompt "say hello"
 ```
 
 Use a custom scheduler config file:
@@ -95,6 +121,7 @@ Dev loop with a one-off agent command override:
 ```powershell
 .\dev.ps1 -AgentCmd "gemini --yolo -p"
 ```
+
 
 The process expects to be started from the repository root so it can access `gateway/` and `INIT.md`.
 
