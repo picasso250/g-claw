@@ -11,12 +11,12 @@ $HomeDir = [Environment]::GetFolderPath("UserProfile")
 $BinDir = Join-Path $HomeDir "bin"
 $GatewayExe = Join-Path $BinDir "glaw.exe"
 
-if ($CronConfig.Trim() -eq "") {
-    $CronConfig = Join-Path $HomeDir "cron.json"
-}
-
 if (!(Test-Path $RunDir)) {
     throw "Run directory not found: $RunDir"
+}
+
+if ($CronConfig.Trim() -eq "") {
+    $CronConfig = Join-Path $RunDir "cron.json"
 }
 
 New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
