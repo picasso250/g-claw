@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import pathlib
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
-import zipfile
 
 DEFAULT_USER_AGENT = "claw-executor/1.0 (+https://remote-executor.io99.xyz)"
 
@@ -33,7 +30,7 @@ def request_json(url: str, token: str, payload: dict | None = None, method: str 
         return json.loads(resp.read().decode("utf-8"))
 
 
-def execute_task(task: dict) -> tuple[int, str, str, pathlib.Path | None]:
+def execute_task(task: dict) -> tuple[int, str, str]:
     raw_cwd = str(task.get("cwd") or "").strip()
     cwd = pathlib.Path(raw_cwd).expanduser() if raw_cwd else pathlib.Path.cwd()
     cwd.mkdir(parents=True, exist_ok=True)
@@ -47,7 +44,6 @@ def execute_task(task: dict) -> tuple[int, str, str, pathlib.Path | None]:
     else:
         raise RuntimeError(f"unsupported lang: {task['lang']}")
 
-    before = {p.resolve() for p in cwd.iterdir()}
     result = subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -58,23 +54,7 @@ def execute_task(task: dict) -> tuple[int, str, str, pathlib.Path | None]:
         timeout=int(task.get("timeout_sec", 300)),
         check=False,
     )
-    after = {p.resolve() for p in cwd.iterdir()}
-    new_files = [
-        path for path in sorted(after - before)
-        if path.is_file() and path.name != script_path.name
-    ]
-    artifact = build_artifact_zip(cwd, new_files) if new_files else None
-    return result.returncode, result.stdout, result.stderr, artifact
-
-
-def build_artifact_zip(cwd: pathlib.Path, files: list[pathlib.Path]) -> pathlib.Path:
-    zip_path = cwd / "executor-artifacts.zip"
-    if zip_path.exists():
-        zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in files:
-            zf.write(path, arcname=path.name)
-    return zip_path
+    return result.returncode, result.stdout, result.stderr
 
 
 def main() -> int:
@@ -103,15 +83,10 @@ def main() -> int:
         exit_code = None
         stdout = ""
         stderr = ""
-        artifact_name = ""
-        artifact_base64 = ""
         error = ""
         try:
-            exit_code, stdout, stderr, artifact = execute_task(task)
+            exit_code, stdout, stderr = execute_task(task)
             status = "succeeded" if exit_code == 0 else "failed"
-            if artifact is not None and artifact.exists():
-                artifact_name = artifact.name
-                artifact_base64 = base64.b64encode(artifact.read_bytes()).decode("ascii")
         except subprocess.TimeoutExpired as exc:
             exit_code = -1
             stdout = exc.stdout or ""
@@ -130,8 +105,6 @@ def main() -> int:
                 "exit_code": exit_code,
                 "stdout": stdout,
                 "stderr": stderr,
-                "artifact_name": artifact_name,
-                "artifact_base64": artifact_base64,
                 "error": error,
             },
         )

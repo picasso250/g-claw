@@ -31,7 +31,6 @@ wrangler secret put EXECUTOR_TOKEN
 
 - `results/<id>/stdout.txt`
 - `results/<id>/stderr.txt`
-- `results/<id>/<artifact_name>`
 
 ## Single-executor assumption
 
@@ -108,8 +107,6 @@ Executor posts JSON to `POST /tasks/:id/result`:
   "exit_code": 0,
   "stdout": "...\n",
   "stderr": "",
-  "artifact_name": "executor-artifacts.zip",
-  "artifact_base64": "<base64 or empty>",
   "error": ""
 }
 ```
