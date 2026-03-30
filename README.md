@@ -47,6 +47,12 @@ Start:
 go run ./cmd/glaw serve
 ```
 
+Read only the latest mail from one sender, then exit:
+
+```powershell
+go run ./cmd/glaw mail latest --sender cjwhshuyao@163.com
+```
+
 Use a custom mail sender allowlist file or directory:
 
 ```powershell
@@ -155,6 +161,10 @@ Manual cron helpers:
 - `glaw cron run -name <task-name>`: run one task immediately
 - `glaw cron run --all-due`: run only the tasks due at `now` or at `--at <RFC3339>`
 
+Mail helper CLI:
+
+- `glaw mail latest --sender <addr>`: connect to IMAP once, read only the latest mail from that sender, save it into `gateway/history`, then exit
+
 Example `./cron.json`:
 
 ```json
@@ -203,6 +213,25 @@ If `im:message.group_msg` is missing, Feishu will typically only deliver group m
 - Replace the module path in `go.mod` with the final repository path.
 - Review the prompt text in `internal/gateway/dispatch.go` for product-specific policy.
 - The assistant command contract is still local and opinionated by design; if you want broader reuse, the next step is to abstract the assistant runner interface.
+
+## Cloudflare Executor
+
+A simpler remote-execution path now lives under `cloudflare-executor/`.
+
+- Worker code: `cloudflare-executor/src/worker.js`
+- Wrangler config template: `cloudflare-executor/wrangler.toml.example`
+- Protocol and deploy notes: `docs/executor-protocol.md`
+
+This path is intended to replace the more fragile mail-driven "smart rescuer" flow with a minimal task queue:
+
+- `POST /tasks`
+- `POST /tasks/claim`
+- `POST /tasks/:id/result`
+- `GET /tasks/:id`
+
+Use a non-empty `EXECUTOR_TOKEN` secret before deploying. The example config is set up for the custom domain `remote-executor.io99.xyz`.
+
+Task scripts should default to running in the executor's current working directory. Only use an explicit `cwd` override when the task truly depends on it.
 
 ## Feishu Helper CLI
 

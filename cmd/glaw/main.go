@@ -343,6 +343,116 @@ func connectMail(config Config) (*client.Client, error) {
 	return c, nil
 }
 
+func senderMatches(filters []string, emailAddr string) bool {
+	for _, filter := range filters {
+		if emailAddr == filter {
+			return true
+		}
+	}
+	return false
+}
+
+func fetchArchivedEmailByUID(c *client.Client, uid uint32, envelope *imap.Envelope) (*gatewaypkg.ArchivedEmail, error) {
+	section := &imap.BodySectionName{}
+	fullSeqSet := new(imap.SeqSet)
+	fullSeqSet.AddNum(uid)
+
+	fullMessages := make(chan *imap.Message, 1)
+	bodyFetchErrCh := make(chan error, 1)
+	go func() {
+		bodyFetchErrCh <- c.UidFetch(fullSeqSet, []imap.FetchItem{section.FetchItem()}, fullMessages)
+	}()
+
+	fullMsg := <-fullMessages
+	if err := <-bodyFetchErrCh; err != nil {
+		return nil, fmt.Errorf("fetch body for uid %d: %w", uid, err)
+	}
+	if fullMsg == nil {
+		return nil, nil
+	}
+
+	r := fullMsg.GetBody(section)
+	if r == nil {
+		return nil, nil
+	}
+
+	mr, err := mail.CreateReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("create reader for uid %d: %w", uid, err)
+	}
+
+	var body string
+	var imageFiles []string
+	var attachmentFiles []string
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			break
+		}
+
+		var contentType string
+		var params map[string]string
+		var filename string
+
+		switch h := p.Header.(type) {
+		case *mail.InlineHeader:
+			contentType, params, _ = h.ContentType()
+			_, dispParams, _ := h.ContentDisposition()
+			filename = dispParams["filename"]
+		case *mail.AttachmentHeader:
+			contentType, params, _ = h.ContentType()
+			_, dispParams, _ := h.ContentDisposition()
+			filename = dispParams["filename"]
+		}
+
+		isImage := strings.HasPrefix(contentType, "image/")
+		isAttachment := false
+		switch p.Header.(type) {
+		case *mail.AttachmentHeader:
+			isAttachment = true
+		}
+
+		if contentType == "text/plain" && body == "" {
+			b, _ := io.ReadAll(p.Body)
+			body = string(b)
+		} else if isImage || isAttachment {
+			savedName, err := savePartToMediaDir(p.Body, contentType, params, filename)
+			if err != nil {
+				log.Printf("[check_mail] [!] Save attachment error: %v", err)
+				continue
+			}
+
+			if isImage {
+				imageFiles = append(imageFiles, savedName)
+				fmt.Printf("    -> [check_mail] Saved Image: %s\n", savedName)
+			}
+			if isAttachment && !isImage {
+				attachmentFiles = append(attachmentFiles, savedName)
+				fmt.Printf("    -> [check_mail] Saved Attachment: %s\n", savedName)
+			}
+		}
+	}
+
+	emailAddr := ""
+	fromName := ""
+	if envelope != nil && len(envelope.From) > 0 {
+		emailAddr = strings.ToLower(envelope.From[0].MailboxName + "@" + envelope.From[0].HostName)
+		fromName = envelope.From[0].PersonalName
+	}
+
+	return &gatewaypkg.ArchivedEmail{
+		FromName:    fromName,
+		FromEmail:   emailAddr,
+		Subject:     envelope.Subject,
+		Date:        envelope.Date,
+		Body:        body,
+		ImageFiles:  imageFiles,
+		Attachments: attachmentFiles,
+	}, nil
+}
+
 func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB, dispatchCh chan gatewaypkg.DispatchRequest) error {
 	if err := os.MkdirAll(gatewaypkg.MediaDir, 0755); err != nil {
 		log.Printf("[check_mail] [!] Create media dir error: %v", err)
@@ -400,116 +510,24 @@ func checkAndProcessEmails(c *client.Client, config *Config, db *sql.DB, dispatc
 		}
 
 		emailAddr := ""
-		fromName := ""
 		if len(msg.Envelope.From) > 0 {
 			emailAddr = strings.ToLower(msg.Envelope.From[0].MailboxName + "@" + msg.Envelope.From[0].HostName)
-			fromName = msg.Envelope.From[0].PersonalName
 		}
 
-		isMatch := false
-		for _, filter := range config.FilterSenders {
-			if emailAddr == filter {
-				isMatch = true
-				break
-			}
-		}
+		isMatch := senderMatches(config.FilterSenders, emailAddr)
 
 		if isMatch {
 			subject := msg.Envelope.Subject
 			fmt.Printf("    [*] [check_mail] Match Found (UID: %d): %s\n", msg.Uid, subject)
-
-			section := &imap.BodySectionName{}
-			fullSeqSet := new(imap.SeqSet)
-			fullSeqSet.AddNum(msg.Uid)
-
-			fullMessages := make(chan *imap.Message, 1)
-			bodyFetchErrCh := make(chan error, 1)
-			go func() {
-				bodyFetchErrCh <- c.UidFetch(fullSeqSet, []imap.FetchItem{section.FetchItem()}, fullMessages)
-			}()
-
-			fullMsg := <-fullMessages
-			if err := <-bodyFetchErrCh; err != nil {
-				return fmt.Errorf("fetch body for uid %d: %w", msg.Uid, err)
-			}
-			if fullMsg == nil {
-				continue
-			}
-
-			r := fullMsg.GetBody(section)
-			if r == nil {
-				continue
-			}
-
-			mr, err := mail.CreateReader(r)
+			archivedEmail, err := fetchArchivedEmailByUID(c, msg.Uid, msg.Envelope)
 			if err != nil {
-				log.Printf("[check_mail] [!] CreateReader error: %v", err)
+				return err
+			}
+			if archivedEmail == nil {
 				continue
 			}
 
-			var body string
-			var imageFiles []string
-			var attachmentFiles []string
-			for {
-				p, err := mr.NextPart()
-				if err == io.EOF {
-					break
-				} else if err != nil {
-					break
-				}
-
-				var contentType string
-				var params map[string]string
-				var filename string
-
-				switch h := p.Header.(type) {
-				case *mail.InlineHeader:
-					contentType, params, _ = h.ContentType()
-					_, dispParams, _ := h.ContentDisposition()
-					filename = dispParams["filename"]
-				case *mail.AttachmentHeader:
-					contentType, params, _ = h.ContentType()
-					_, dispParams, _ := h.ContentDisposition()
-					filename = dispParams["filename"]
-				}
-
-				isImage := strings.HasPrefix(contentType, "image/")
-				isAttachment := false
-				switch p.Header.(type) {
-				case *mail.AttachmentHeader:
-					isAttachment = true
-				}
-
-				if contentType == "text/plain" && body == "" {
-					b, _ := io.ReadAll(p.Body)
-					body = string(b)
-				} else if isImage || isAttachment {
-					savedName, err := savePartToMediaDir(p.Body, contentType, params, filename)
-					if err != nil {
-						log.Printf("[check_mail] [!] Save attachment error: %v", err)
-						continue
-					}
-
-					if isImage {
-						imageFiles = append(imageFiles, savedName)
-						fmt.Printf("    -> [check_mail] Saved Image: %s\n", savedName)
-					}
-					if isAttachment && !isImage {
-						attachmentFiles = append(attachmentFiles, savedName)
-						fmt.Printf("    -> [check_mail] Saved Attachment: %s\n", savedName)
-					}
-				}
-			}
-
-			archiveContent := gatewaypkg.BuildEmailArchiveContent(gatewaypkg.ArchivedEmail{
-				FromName:    fromName,
-				FromEmail:   emailAddr,
-				Subject:     subject,
-				Date:        msg.Envelope.Date,
-				Body:        body,
-				ImageFiles:  imageFiles,
-				Attachments: attachmentFiles,
-			})
+			archiveContent := gatewaypkg.BuildEmailArchiveContent(*archivedEmail)
 
 			archiveFile, err := gatewaypkg.SavePendingEmail(msg.Uid, emailAddr, archiveContent, time.Now())
 			if err == nil {
@@ -633,6 +651,107 @@ func mailLoop(config Config, db *sql.DB, dispatchCh chan gatewaypkg.DispatchRequ
 			triggerCheck = true
 		}
 	}
+}
+
+func runMailLatest(args []string) error {
+	fs := flag.NewFlagSet("mail latest", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	envPath := fs.String("env", "auto", "env file path, or 'auto' to use upward lookup")
+	sender := fs.String("sender", "", "one sender email address to inspect")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments for mail latest: %s", strings.Join(fs.Args(), " "))
+	}
+	if strings.TrimSpace(*sender) == "" {
+		return fmt.Errorf("missing -sender")
+	}
+	if info, err := os.Stat("gateway"); err != nil || !info.IsDir() {
+		return fmt.Errorf("current working directory must be glaw root: missing gateway/")
+	}
+
+	config, err := loadEnv(*envPath)
+	if err != nil {
+		return fmt.Errorf("load .env: %w", err)
+	}
+	config.FilterSenders = parseFilterSenders(*sender)
+	if len(config.FilterSenders) != 1 {
+		return fmt.Errorf("mail latest requires exactly one sender")
+	}
+
+	if err := gatewaypkg.EnsureRuntimeDirs(); err != nil {
+		return fmt.Errorf("ensure runtime dirs: %w", err)
+	}
+
+	c, err := connectMail(config)
+	if err != nil {
+		return err
+	}
+	defer c.Logout()
+
+	_, err = c.Select("INBOX", false)
+	if err != nil {
+		return fmt.Errorf("select inbox: %w", err)
+	}
+
+	uids, err := c.UidSearch(imap.NewSearchCriteria())
+	if err != nil {
+		return fmt.Errorf("search inbox: %w", err)
+	}
+	if len(uids) == 0 {
+		return fmt.Errorf("no mail in inbox")
+	}
+
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uids...)
+	messages := make(chan *imap.Message, len(uids))
+	fetchErrCh := make(chan error, 1)
+	go func() {
+		fetchErrCh <- c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, messages)
+	}()
+
+	var latestMsg *imap.Message
+	var latestSender string
+	for msg := range messages {
+		if msg == nil || msg.Envelope == nil || len(msg.Envelope.From) == 0 {
+			continue
+		}
+		emailAddr := strings.ToLower(msg.Envelope.From[0].MailboxName + "@" + msg.Envelope.From[0].HostName)
+		if !senderMatches(config.FilterSenders, emailAddr) {
+			continue
+		}
+		if latestMsg == nil || msg.Uid > latestMsg.Uid {
+			latestMsg = msg
+			latestSender = emailAddr
+		}
+	}
+	if err := <-fetchErrCh; err != nil {
+		return fmt.Errorf("fetch envelope: %w", err)
+	}
+	if latestMsg == nil {
+		return fmt.Errorf("no mail found for sender %s", config.FilterSenders[0])
+	}
+
+	archivedEmail, err := fetchArchivedEmailByUID(c, latestMsg.Uid, latestMsg.Envelope)
+	if err != nil {
+		return err
+	}
+	if archivedEmail == nil {
+		return fmt.Errorf("latest mail uid %d has empty body", latestMsg.Uid)
+	}
+
+	archiveContent := gatewaypkg.BuildEmailArchiveContent(*archivedEmail)
+	archiveFile, err := gatewaypkg.SaveHistoryMessage("email_latest", fmt.Sprintf("%d", latestMsg.Uid), latestSender, archiveContent, time.Now())
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("latest_uid=%d\n", latestMsg.Uid)
+	fmt.Printf("sender=%s\n", latestSender)
+	fmt.Printf("subject=%s\n", latestMsg.Envelope.Subject)
+	fmt.Printf("saved=%s\n", archiveFile)
+	return nil
 }
 
 func runServe(args []string) error {
@@ -959,6 +1078,19 @@ func runFeishu(args []string) error {
 	}
 }
 
+func runMail(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("missing mail subcommand")
+	}
+
+	switch args[0] {
+	case "latest":
+		return runMailLatest(args[1:])
+	default:
+		return fmt.Errorf("unknown mail subcommand %q", args[0])
+	}
+}
+
 func runCronList(args []string) error {
 	fs := flag.NewFlagSet("cron list", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -1222,6 +1354,7 @@ func runCron(args []string) error {
 func usage() string {
 	return strings.TrimSpace(`Usage:
   glaw serve [--agent-cmd <command-prefix>] [--cron-config <path>] [--mail-filter <path-or-dir>] [--env <path|auto>] [--dry-run] [--run-prompt <text>]
+  glaw mail latest -sender <addr> [--env <path|auto>]
   glaw cron list [--cron-config <path>]
   glaw cron check [--cron-config <path>] [--at <rfc3339>]
   glaw cron run [--cron-config <path>] [-name <task-name> | --all-due] [--at <rfc3339>] [--env <path|auto>]
@@ -1240,6 +1373,8 @@ func main() {
 	switch args[0] {
 	case "serve":
 		err = runServe(args[1:])
+	case "mail":
+		err = runMail(args[1:])
 	case "cron":
 		err = runCron(args[1:])
 	case "feishu":

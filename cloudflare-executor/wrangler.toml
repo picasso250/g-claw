@@ -1,0 +1,16 @@
+name = "glaw-executor"
+main = "src/worker.js"
+compatibility_date = "2026-03-30"
+workers_dev = false
+
+routes = [
+  { pattern = "remote-executor.io99.xyz", custom_domain = true }
+]
+
+[[kv_namespaces]]
+binding = "EXECUTOR_KV"
+id = "b9615675b090426086faac097222cec5"
+
+[[r2_buckets]]
+binding = "EXECUTOR_RESULTS"
+bucket_name = "glaw-executor-results"
