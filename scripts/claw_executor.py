@@ -62,7 +62,7 @@ def main() -> int:
     parser.add_argument("--worker-url", required=True)
     parser.add_argument("--token", default=os.environ.get("EXECUTOR_TOKEN", ""))
     parser.add_argument("--agent-id", default="claw-executor")
-    parser.add_argument("--poll-interval", type=float, default=5.0)
+    parser.add_argument("--poll-interval", type=float, default=30.0)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if not args.token.strip():
