@@ -52,6 +52,7 @@ func (d *Dispatcher) DispatchBatch(requests []DispatchRequest) bool {
 
 	var emailPaths []string
 	var feishuMessages []string
+	var aiPrompts []string
 	for _, req := range requests {
 		switch strings.TrimSpace(req.Type) {
 		case "email":
@@ -62,28 +63,34 @@ func (d *Dispatcher) DispatchBatch(requests []DispatchRequest) bool {
 			if strings.TrimSpace(req.Message) != "" {
 				feishuMessages = append(feishuMessages, req.Message)
 			}
+		case "ai":
+			if strings.TrimSpace(req.Message) != "" {
+				aiPrompts = append(aiPrompts, req.Message)
+			}
 		default:
 			log.Printf("[dispatch] [!] Unknown dispatch request type %q", req.Type)
 		}
 	}
 
-	if len(emailPaths) == 0 && len(feishuMessages) == 0 {
+	if len(emailPaths) == 0 && len(feishuMessages) == 0 && len(aiPrompts) == 0 {
 		return false
 	}
 
-	if !d.callAgentBatch(emailPaths, feishuMessages) {
+	if !d.callAgentBatch(emailPaths, feishuMessages, aiPrompts) {
 		if len(emailPaths) > 0 {
 			log.Printf("[dispatch] [!] Gemini run failed for batch with %d email files", len(emailPaths))
-		} else {
+		} else if len(feishuMessages) > 0 {
 			log.Printf("[dispatch] [!] Gemini run failed for feishu batch")
+		} else {
+			log.Printf("[dispatch] [!] Gemini run failed for ai batch with %d prompts", len(aiPrompts))
 		}
 		return false
 	}
 	return true
 }
 
-func (d *Dispatcher) callAgentBatch(emailPaths, feishuMessages []string) bool {
-	if len(emailPaths) == 0 && len(feishuMessages) == 0 {
+func (d *Dispatcher) callAgentBatch(emailPaths, feishuMessages, aiPrompts []string) bool {
+	if len(emailPaths) == 0 && len(feishuMessages) == 0 && len(aiPrompts) == 0 {
 		return true
 	}
 	fmt.Printf("\n%s AGENT SESSION START (GATEWAY BATCH) %s\n", strings.Repeat(">", 20), strings.Repeat("<", 20))
@@ -93,17 +100,26 @@ func (d *Dispatcher) callAgentBatch(emailPaths, feishuMessages []string) bool {
 		af, _ := filepath.Abs(f)
 		absFiles = append(absFiles, af)
 	}
-	prompt := buildBatchPrompt(absInit, absFiles, feishuMessages)
-	return d.executeAgentPrompt(classifyPromptSource(absFiles, feishuMessages), prompt, strings.Join(absFiles, "\n"), "")
+	prompt := buildBatchPrompt(absInit, absFiles, feishuMessages, aiPrompts)
+	return d.executeAgentPrompt(
+		classifyPromptSource(absFiles, feishuMessages, aiPrompts),
+		prompt,
+		strings.Join(absFiles, "\n"),
+		strings.Join(feishuMessages, "\n===\n"),
+		strings.Join(aiPrompts, "\n===\n"),
+	)
 }
 
-func (d *Dispatcher) executeAgentPrompt(source, prompt, fileList, feishuSummary string) bool {
+func (d *Dispatcher) executeAgentPrompt(source, prompt, fileList, feishuSummary, aiSummary string) bool {
 	fmt.Printf("[dispatch] [*] Source: %s\n", source)
 	if strings.TrimSpace(fileList) != "" {
 		fmt.Printf("[dispatch] [*] Files to process: %s\n", fileList)
 	}
 	if strings.TrimSpace(feishuSummary) != "" {
 		fmt.Printf("[dispatch] [*] Feishu messages:\n%s\n", feishuSummary)
+	}
+	if strings.TrimSpace(aiSummary) != "" {
+		fmt.Printf("[dispatch] [*] AI prompts:\n%s\n", aiSummary)
 	}
 	fmt.Printf("[dispatch] [*] Prompt begin\n%s\n[dispatch] [*] Prompt end\n", prompt)
 
@@ -133,12 +149,15 @@ func (d *Dispatcher) executeAgentPrompt(source, prompt, fileList, feishuSummary 
 	return true
 }
 
-func classifyPromptSource(emailPaths, feishuMessages []string) string {
-	if len(emailPaths) > 0 && len(feishuMessages) == 0 {
+func classifyPromptSource(emailPaths, feishuMessages, aiPrompts []string) string {
+	if len(emailPaths) > 0 && len(feishuMessages) == 0 && len(aiPrompts) == 0 {
 		return "email"
 	}
-	if len(emailPaths) == 0 && len(feishuMessages) > 0 {
+	if len(emailPaths) == 0 && len(feishuMessages) > 0 && len(aiPrompts) == 0 {
 		return "feishu"
+	}
+	if len(emailPaths) == 0 && len(feishuMessages) == 0 && len(aiPrompts) > 0 {
+		return "ai"
 	}
 	return "mixed"
 }

@@ -1,6 +1,7 @@
 param(
     [string]$RunDir = (Get-Location).Path,
-    [string]$AgentCmd = ""
+    [string]$AgentCmd = "",
+    [string]$CronConfig = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,6 +10,10 @@ $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $HomeDir = [Environment]::GetFolderPath("UserProfile")
 $BinDir = Join-Path $HomeDir "bin"
 $GatewayExe = Join-Path $BinDir "glaw.exe"
+
+if ($CronConfig.Trim() -eq "") {
+    $CronConfig = Join-Path $HomeDir "cron.json"
+}
 
 if (!(Test-Path $RunDir)) {
     throw "Run directory not found: $RunDir"
@@ -43,6 +48,9 @@ try {
     $ServeArgs = @("serve")
     if ($AgentCmd.Trim() -ne "") {
         $ServeArgs += @("--agent-cmd", $AgentCmd)
+    }
+    if ($CronConfig.Trim() -ne "") {
+        $ServeArgs += @("--cron-config", $CronConfig)
     }
     Write-Host "[dev] command: $GatewayExe $($ServeArgs -join ' ')"
     & $GatewayExe @ServeArgs

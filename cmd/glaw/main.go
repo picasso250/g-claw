@@ -567,6 +567,7 @@ func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	agentCmd := fs.String("agent-cmd", "", "override AGENT_CMD from .env for this serve process")
+	cronConfig := fs.String("cron-config", gatewaypkg.DefaultCronConfigPath, "path to scheduler config JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -616,6 +617,7 @@ func runServe(args []string) error {
 
 	go dispatchLoop(dispatcher, dispatchCh, stopGateway)
 	go mailLoop(config, db, dispatchCh, stopGateway)
+	go gatewaypkg.NewScheduler(*cronConfig, dispatchCh).Run(stopGateway)
 	if feishuEnabled {
 		go func() {
 			if err := gatewaypkg.StartFeishuLongConn(config.Feishu, db, dispatchCh); err != nil {
@@ -857,7 +859,7 @@ func runFeishu(args []string) error {
 
 func usage() string {
 	return strings.TrimSpace(`Usage:
-  glaw serve [--agent-cmd <command-prefix>]
+  glaw serve [--agent-cmd <command-prefix>] [--cron-config <path>]
   glaw feishu list-messages -chat-id <chat_id> [-page-size 20] [-minutes 120]
   glaw feishu send -message-id <message_id> (-text <text> | -image <path> | -file <path>)`)
 }

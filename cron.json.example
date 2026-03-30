@@ -1,0 +1,15 @@
+[
+  {
+    "name": "hourly-sync",
+    "schedule": "hourly",
+    "command": "python",
+    "args": ["scripts/sync.py"]
+  },
+  {
+    "name": "daily-summary",
+    "schedule": "daily",
+    "type": "ai",
+    "hours": [9, 21],
+    "prompt": "整理今天的进展并给出下一步建议。"
+  }
+]

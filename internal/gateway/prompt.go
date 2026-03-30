@@ -5,14 +5,14 @@ import (
 	"strings"
 )
 
-func buildBatchPrompt(absInit string, emailPaths, feishuMessages []string) string {
+func buildBatchPrompt(absInit string, emailPaths, feishuMessages, aiPrompts []string) string {
 	switch {
-	case len(emailPaths) > 0 && len(feishuMessages) == 0:
+	case len(emailPaths) > 0 && len(feishuMessages) == 0 && len(aiPrompts) == 0:
 		return fmt.Sprintf(`读 %s 并处理下面这些待处理邮件消息文件: %s 。
 - 遵从消息中的指令。
 - 使用 send-email 技能 回复邮件。
 `, absInit, strings.Join(emailPaths, "\n"))
-	case len(emailPaths) == 0 && len(feishuMessages) > 0:
+	case len(emailPaths) == 0 && len(feishuMessages) > 0 && len(aiPrompts) == 0:
 		return fmt.Sprintf(`读 %s 并处理下面的飞书消息。
 ===
 %s
@@ -23,11 +23,21 @@ func buildBatchPrompt(absInit string, emailPaths, feishuMessages []string) strin
 - 图片回复：~/bin/glaw.exe feishu send -message-id <原消息MessageID> -image <本地图片路径>
 - 文件回复：~/bin/glaw.exe feishu send -message-id <原消息MessageID> -file <本地文件路径>
 `, absInit, strings.Join(feishuMessages, "\n===\n"))
+	case len(emailPaths) == 0 && len(feishuMessages) == 0 && len(aiPrompts) > 0:
+		return fmt.Sprintf(`读 %s 并处理下面这些定时 AI 任务提示词。
+===
+%s
+===
+- 这些任务来自 gateway 内部 scheduler，已经通过同一个 dispatch 串行入口进入当前会话。
+- 如果需要回复飞书，请直接运行 ~/bin/glaw.exe feishu send。
+`, absInit, strings.Join(aiPrompts, "\n===\n"))
 	default:
 		return fmt.Sprintf(`读 %s 并处理当前批次消息。
 - 待处理邮件消息文件:
 %s
 - 待处理飞书消息:
+%s
+- 定时 AI 任务提示词:
 %s
 - 必须在同一个 agent 会话中串行处理，绝不要并行启动多个 agent。
 - 对邮件：遵从消息中的指令；使用 send-email 技能 回复邮件。
@@ -36,6 +46,6 @@ func buildBatchPrompt(absInit string, emailPaths, feishuMessages []string) strin
 - 文本回复：~/bin/glaw.exe feishu send -message-id <原消息MessageID> -text "<简短回复>"
 - 图片回复：~/bin/glaw.exe feishu send -message-id <原消息MessageID> -image <本地图片路径>
 - 文件回复：~/bin/glaw.exe feishu send -message-id <原消息MessageID> -file <本地文件路径>
-`, absInit, strings.Join(emailPaths, "\n"), strings.Join(feishuMessages, "\n===\n"))
+`, absInit, strings.Join(emailPaths, "\n"), strings.Join(feishuMessages, "\n===\n"), strings.Join(aiPrompts, "\n===\n"))
 	}
 }

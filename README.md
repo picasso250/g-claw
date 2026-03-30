@@ -46,6 +46,12 @@ Start:
 go run ./cmd/glaw serve
 ```
 
+Use a custom scheduler config file:
+
+```powershell
+go run ./cmd/glaw serve --cron-config .\cron.json
+```
+
 Temporarily override the assistant runner for one `serve` process:
 
 ```powershell
@@ -90,7 +96,42 @@ Dispatch batching:
 - Each dispatch wake-up drains the current channel and batches that snapshot into one agent run.
 - all-email batch: use the email prompt
 - all-feishu batch: use the feishu prompt
+- all-ai batch: use the scheduled AI prompt
 - mixed batch: use the default prompt
+
+## Scheduler
+
+`serve` also watches `./cron.json` by default. If the file does not exist, the scheduler stays idle. A starter example is included at `./cron.json.example`.
+
+Supported schedules:
+
+- `hourly`: run once at every `HH:00`
+- `daily`: run at every configured hour in `hours`, where each value is `0-23`
+
+Supported task types:
+
+- `program` or empty `type`: execute `command` plus `args`
+- `ai`: enqueue `prompt` into the existing `dispatchCh`, so scheduled AI work stays inside the same serialized dispatch path as email and Feishu
+
+Example `./cron.json`:
+
+```json
+[
+  {
+    "name": "hourly-sync",
+    "schedule": "hourly",
+    "command": "python",
+    "args": ["scripts/sync.py"]
+  },
+  {
+    "name": "daily-summary",
+    "schedule": "daily",
+    "type": "ai",
+    "hours": [9, 21],
+    "prompt": "整理今天的进展并给出下一步建议。"
+  }
+]
+```
 
 ## Feishu Bot
 
