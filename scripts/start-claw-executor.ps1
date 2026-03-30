@@ -42,6 +42,7 @@ Write-Host "===== claw-executor start ====="
 Get-Content -LiteralPath $StartLogPath
 Write-Host ""
 Write-Host "===== claw-executor runtime ====="
-python $ExecutorScript --worker-url $WorkerUrl --agent-id $AgentId 2>&1 | Tee-Object -FilePath $RuntimeLogPath -Append
+Write-Host "logging to: $RuntimeLogPath"
+python -u $ExecutorScript --worker-url $WorkerUrl --agent-id $AgentId 2>&1 | Tee-Object -FilePath $RuntimeLogPath -Append
 
 Write-Host "start log: $StartLogPath"
