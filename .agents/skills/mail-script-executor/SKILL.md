@@ -42,10 +42,10 @@ Use `mail-script-executor/scripts/send_and_check_reply.py` for the common send -
 
 ```bash
 python mail-script-executor/scripts/send_and_check_reply.py \
-  --to cjwhshuyao@163.com \
+  --to trusted-recipient@example.com \
   --subject "claw-life-saver probe git clean" \
   --body-file C:\path\to\gateway\outbox\mail.md \
   --attachment C:\path\to\script.py \
-  --reply-sender cjwhshuyao@163.com \
+  --reply-sender trusted-recipient@example.com \
   --repo C:\path\to\glaw
 ```
