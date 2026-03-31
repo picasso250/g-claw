@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -217,6 +218,16 @@ func buildExecutionResultPaths(baseDir string, uid uint32, sender string, now ti
 	return filepath.Join(baseDir, base+".stdout.txt"), filepath.Join(baseDir, base+".stderr.txt")
 }
 
+func buildExecutionZipPath(baseDir string, uid uint32, sender string, now time.Time) string {
+	base := fmt.Sprintf(
+		"mail_exec_%s_%s_%d",
+		sanitizeFilenameToken(sender),
+		now.UTC().Format("2006-01-02T15-04-05Z"),
+		uid,
+	)
+	return filepath.Join(baseDir, base+".zip")
+}
+
 func selectExecutableAttachment(savedNames []string) (string, error) {
 	if len(savedNames) != 1 {
 		return "", fmt.Errorf("expected exactly 1 attachment, got %d", len(savedNames))
@@ -277,6 +288,77 @@ func executeMailAttachment(scriptPath string) (string, string, error) {
 	return stdoutBuf.String(), stderrBuf.String(), err
 }
 
+func collectReplyAttachmentPaths(body, baseDir string) []string {
+	var paths []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(body, "\n") {
+		candidate := strings.TrimSpace(line)
+		if candidate == "" {
+			continue
+		}
+		if strings.HasPrefix(candidate, "#") {
+			continue
+		}
+
+		resolved := candidate
+		if !filepath.IsAbs(resolved) {
+			resolved = filepath.Join(baseDir, resolved)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			continue
+		}
+		key := strings.ToLower(resolved)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		paths = append(paths, resolved)
+	}
+	return paths
+}
+
+func addFileToZip(zw *zip.Writer, diskPath, archiveName string) error {
+	data, err := os.ReadFile(diskPath)
+	if err != nil {
+		return err
+	}
+	w, err := zw.Create(archiveName)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
+}
+
+func buildExecutionResultZip(zipPath string, stdoutPath string, stderrPath string, extraPaths []string) error {
+	f, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	zw := zip.NewWriter(f)
+	defer zw.Close()
+
+	if err := addFileToZip(zw, stdoutPath, filepath.Base(stdoutPath)); err != nil {
+		return err
+	}
+	if err := addFileToZip(zw, stderrPath, filepath.Base(stderrPath)); err != nil {
+		return err
+	}
+	for _, extraPath := range extraPaths {
+		if err := addFileToZip(zw, extraPath, filepath.Base(extraPath)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func processExecutionMail(config *Config, uid uint32, sender, subject string, archivedEmail *gatewaypkg.ArchivedEmail) error {
 	tempDir, err := os.MkdirTemp("", "glaw-mail-exec-*")
 	if err != nil {
@@ -286,6 +368,7 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 	log.Printf("[mail_exec] [*] Created temp dir for uid=%d: %s", uid, tempDir)
 
 	stdoutPath, stderrPath := buildExecutionResultPaths(tempDir, uid, sender, time.Now())
+	zipPath := buildExecutionZipPath(tempDir, uid, sender, time.Now())
 	stdout := ""
 	stderr := ""
 
@@ -319,12 +402,20 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 		return err
 	}
 	log.Printf("[mail_exec] [*] Wrote execution result files for uid=%d stdout=%s stderr=%s", uid, stdoutPath, stderrPath)
+	replyAttachmentPaths := collectReplyAttachmentPaths(archivedEmail.Body, tempDir)
+	if len(replyAttachmentPaths) > 0 {
+		log.Printf("[mail_exec] [*] Collected %d reply attachment path(s) from body for uid=%d", len(replyAttachmentPaths), uid)
+	}
+	if err := buildExecutionResultZip(zipPath, stdoutPath, stderrPath, replyAttachmentPaths); err != nil {
+		return err
+	}
+	log.Printf("[mail_exec] [*] Built execution result zip for uid=%d: %s", uid, zipPath)
 
 	return sendMailWithAttachments(
 		*config,
 		sender,
 		normalizeReplySubject(subject),
-		"Attached are stdout.txt and stderr.txt for the requested execution.\n",
-		[]string{stdoutPath, stderrPath},
+		"Attached is a zip containing stdout.txt, stderr.txt, and any existing file paths listed line-by-line in the mail body.\n",
+		[]string{zipPath},
 	)
 }
