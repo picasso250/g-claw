@@ -1,26 +1,44 @@
 export default {
   async fetch(request, env) {
     try {
-      if (!isAuthorized(request, env)) {
-        return json({ ok: false, error: "unauthorized" }, 401);
-      }
-
       const url = new URL(request.url);
       const path = url.pathname.replace(/\/+$/, "") || "/";
 
-      if (request.method === "POST" && path === "/tasks") {
-        return await createTask(request, env);
+      if (request.method === "POST" && path === "/logs/upload") {
+        if (!isAuthorized(request, env)) {
+          return json({ ok: false, error: "unauthorized" }, 401);
+        }
+        return await uploadLogBundle(request, env);
       }
-      if (request.method === "POST" && path === "/tasks/claim") {
-        return await claimTask(request, env);
+      if (request.method === "GET" && path === "/logs/index") {
+        if (!isAuthorized(request, env)) {
+          return json({ ok: false, error: "unauthorized" }, 401);
+        }
+        return await getLogIndex(url, env);
       }
-      if (request.method === "GET" && path.startsWith("/tasks/")) {
-        const taskId = path.slice("/tasks/".length);
-        return await getTask(taskId, env);
+      if (request.method === "GET" && path === "/logs/latest") {
+        if (!isAuthorized(request, env)) {
+          return json({ ok: false, error: "unauthorized" }, 401);
+        }
+        return await getLatestLog(url, env);
       }
-      if (request.method === "POST" && path.startsWith("/tasks/") && path.endsWith("/result")) {
-        const taskId = path.slice("/tasks/".length, -"/result".length);
-        return await saveResult(taskId, request, env);
+      if (request.method === "GET" && path === "/logs/object") {
+        if (!(isAuthorized(request, env) || await hasValidSignedDownload(url, env))) {
+          return json({ ok: false, error: "unauthorized" }, 401);
+        }
+        return await getLogObject(url, env);
+      }
+      if (request.method === "POST" && path === "/artifacts/upload") {
+        if (!isAuthorized(request, env)) {
+          return json({ ok: false, error: "unauthorized" }, 401);
+        }
+        return await uploadArtifact(request, env);
+      }
+      if (request.method === "GET" && path === "/artifacts/object") {
+        if (!(isAuthorized(request, env) || await hasValidSignedDownload(url, env))) {
+          return json({ ok: false, error: "unauthorized" }, 401);
+        }
+        return await getArtifactObject(url, env);
       }
 
       return json({ ok: false, error: "not_found" }, 404);
@@ -37,7 +55,8 @@ export default {
   },
 };
 
-const QUEUE_KEY = "queue:pending";
+const RECENT_LIMIT = 168;
+const DEFAULT_SIGNED_URL_TTL_SEC = 30 * 24 * 60 * 60;
 
 function isAuthorized(request, env) {
   const expected = (env.EXECUTOR_TOKEN || "").trim();
@@ -48,221 +67,324 @@ function isAuthorized(request, env) {
   return actual === `Bearer ${expected}`;
 }
 
-function taskSpecKey(taskId) {
-  return `task:${taskId}:spec`;
-}
-
-function taskStateKey(taskId) {
-  return `task:${taskId}:state`;
-}
-
-function stdoutKey(taskId) {
-  return `results/${taskId}/stdout.txt`;
-}
-
-function stderrKey(taskId) {
-  return `results/${taskId}/stderr.txt`;
-}
-
-function artifactKey(taskId, fileName) {
-  return `results/${taskId}/${fileName}`;
-}
-
-async function createTask(request, env) {
+async function uploadLogBundle(request, env) {
   const payload = await request.json();
-  const task = normalizeTaskSpec(payload);
-  const now = new Date().toISOString();
-  task.created_at = task.created_at || now;
-
-  const state = {
-    id: task.id,
-    status: "pending",
-    claimed_by: "",
-    claimed_at: "",
-    started_at: "",
-    finished_at: "",
-    exit_code: null,
-    result_stdout_key: "",
-    result_stderr_key: "",
-    artifact_key: "",
-    error: "",
+  const host = normalizeName(payload.host, "host");
+  const service = normalizeName(payload.service, "service");
+  const uploadedAt = normalizeTimestamp(payload.timestamp);
+  const archiveName = sanitizeFileName(String(payload.archive_name || "logs.zip"));
+  const contentType = String(payload.content_type || "application/zip");
+  const summary = normalizeSummary(payload.summary);
+  const metadata = {
+    host,
+    service,
+    uploaded_at: uploadedAt,
+    archive_name: archiveName,
+    content_type: contentType,
+    summary,
   };
 
-  await env.EXECUTOR_KV.put(taskSpecKey(task.id), JSON.stringify(task));
-  await env.EXECUTOR_KV.put(taskStateKey(task.id), JSON.stringify(state));
+  const archiveBytes = decodeBase64Field(payload.archive_base64, "archive_base64");
+  const objectKey = buildObjectKey(host, service, uploadedAt, archiveName);
 
-  const queue = await readQueue(env);
-  if (!queue.includes(task.id)) {
-    queue.push(task.id);
-    await writeQueue(env, queue);
-  }
+  await env.EXECUTOR_RESULTS.put(objectKey, archiveBytes, {
+    httpMetadata: { contentType },
+  });
 
-  return json({ ok: true, task, state });
-}
+  const indexEntry = {
+    ...metadata,
+    key: objectKey,
+    size: archiveBytes.byteLength,
+    received_at: new Date().toISOString(),
+    expires_at: buildExpiresAt(DEFAULT_SIGNED_URL_TTL_SEC),
+    download_url: "",
+  };
 
-async function claimTask(request, env) {
-  const payload = await request.json().catch(() => ({}));
-  const agentId = String(payload.agent_id || "").trim();
-  if (!agentId) {
-    return json({ ok: false, error: "agent_id_required" }, 400);
-  }
+  indexEntry.download_url = await buildSignedDownloadUrl(request, env, objectKey, indexEntry.expires_at);
 
-  const queue = await readQueue(env);
-  const nextQueue = [...queue];
+  const latestKey = latestIndexKey(host, service);
+  const recentKey = recentIndexKey(host, service);
+  const pointKey = pointIndexKey(host, service, uploadedAt);
 
-  while (nextQueue.length > 0) {
-    const taskId = nextQueue.shift();
-    const rawSpec = await env.EXECUTOR_KV.get(taskSpecKey(taskId));
-    const rawState = await env.EXECUTOR_KV.get(taskStateKey(taskId));
-    if (!rawSpec || !rawState) {
-      continue;
-    }
+  const recent = await readJson(env.EXECUTOR_KV, recentKey, []);
+  const nextRecent = [indexEntry, ...recent.filter((entry) => entry.key !== objectKey)].slice(0, RECENT_LIMIT);
 
-    const task = JSON.parse(rawSpec);
-    const state = JSON.parse(rawState);
-    if (state.status !== "pending") {
-      continue;
-    }
-
-    const now = new Date().toISOString();
-    state.status = "claimed";
-    state.claimed_by = agentId;
-    state.claimed_at = now;
-    state.started_at = now;
-
-    await env.EXECUTOR_KV.put(taskStateKey(taskId), JSON.stringify(state));
-    await writeQueue(env, nextQueue);
-    return json({ ok: true, task, state });
-  }
-
-  await writeQueue(env, nextQueue);
-  return json({ ok: true, task: null });
-}
-
-async function getTask(taskId, env) {
-  if (!taskId) {
-    return json({ ok: false, error: "task_id_required" }, 400);
-  }
-
-  const [rawSpec, rawState] = await Promise.all([
-    env.EXECUTOR_KV.get(taskSpecKey(taskId)),
-    env.EXECUTOR_KV.get(taskStateKey(taskId)),
+  await Promise.all([
+    env.EXECUTOR_KV.put(latestKey, JSON.stringify(indexEntry)),
+    env.EXECUTOR_KV.put(recentKey, JSON.stringify(nextRecent)),
+    env.EXECUTOR_KV.put(pointKey, JSON.stringify(indexEntry)),
   ]);
-  if (!rawSpec || !rawState) {
-    return json({ ok: false, error: "task_not_found" }, 404);
+
+  return json({ ok: true, entry: indexEntry });
+}
+
+async function getLogIndex(url, env) {
+  const host = normalizeName(url.searchParams.get("host"), "host");
+  const service = normalizeName(url.searchParams.get("service"), "service");
+  const limit = clampInt(url.searchParams.get("limit"), 20, 1, 200);
+  const entries = await readJson(env.EXECUTOR_KV, recentIndexKey(host, service), []);
+  return json({
+    ok: true,
+    host,
+    service,
+    entries: entries.slice(0, limit),
+  });
+}
+
+async function getLatestLog(url, env) {
+  const host = normalizeName(url.searchParams.get("host"), "host");
+  const service = normalizeName(url.searchParams.get("service"), "service");
+  const entry = await readJson(env.EXECUTOR_KV, latestIndexKey(host, service), null);
+  if (!entry) {
+    return json({ ok: false, error: "log_not_found" }, 404);
   }
+  return json({ ok: true, entry });
+}
+
+async function getLogObject(url, env) {
+  const key = String(url.searchParams.get("key") || "").trim();
+  if (!key.startsWith("logs/")) {
+    return json({ ok: false, error: "invalid_key" }, 400);
+  }
+
+  const object = await env.EXECUTOR_RESULTS.get(key);
+  if (!object) {
+    return json({ ok: false, error: "object_not_found" }, 404);
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "private, max-age=60");
+  headers.set("content-disposition", `attachment; filename="${key.split("/").pop()}"`);
+
+  return new Response(object.body, {
+    status: 200,
+    headers,
+  });
+}
+
+async function uploadArtifact(request, env) {
+  const payload = await request.json();
+  const channel = normalizeName(payload.channel, "channel");
+  const uploadedAt = normalizeTimestamp(payload.timestamp);
+  const fileName = sanitizeFileName(String(payload.file_name || "artifact.zip"));
+  const contentType = String(payload.content_type || "application/zip");
+  const archiveBytes = decodeBase64Field(payload.file_base64, "file_base64");
+  const digestHex = await sha256Hex(archiveBytes);
+  const key = buildArtifactKey(channel, uploadedAt, fileName);
+
+  await env.EXECUTOR_RESULTS.put(key, archiveBytes, {
+    httpMetadata: { contentType },
+  });
+
+  const expiresAt = buildExpiresAt(DEFAULT_SIGNED_URL_TTL_SEC);
 
   return json({
     ok: true,
-    task: JSON.parse(rawSpec),
-    state: JSON.parse(rawState),
-  });
-}
-
-async function saveResult(taskId, request, env) {
-  if (!taskId) {
-    return json({ ok: false, error: "task_id_required" }, 400);
-  }
-
-  const rawState = await env.EXECUTOR_KV.get(taskStateKey(taskId));
-  if (!rawState) {
-    return json({ ok: false, error: "task_not_found" }, 404);
-  }
-
-  const payload = await request.json();
-  const state = JSON.parse(rawState);
-  const now = new Date().toISOString();
-
-  const stdout = String(payload.stdout || "");
-  const stderr = String(payload.stderr || "");
-  await env.EXECUTOR_RESULTS.put(stdoutKey(taskId), stdout, {
-    httpMetadata: { contentType: "text/plain; charset=utf-8" },
-  });
-  await env.EXECUTOR_RESULTS.put(stderrKey(taskId), stderr, {
-    httpMetadata: { contentType: "text/plain; charset=utf-8" },
-  });
-
-  state.result_stdout_key = stdoutKey(taskId);
-  state.result_stderr_key = stderrKey(taskId);
-  state.exit_code = toNullableNumber(payload.exit_code);
-  state.error = String(payload.error || "");
-  state.finished_at = now;
-  state.status = payload.status === "succeeded" ? "succeeded" : "failed";
-
-  if (payload.artifact_name && payload.artifact_base64) {
-    const bytes = Uint8Array.from(atob(String(payload.artifact_base64)), (c) => c.charCodeAt(0));
-    const key = artifactKey(taskId, sanitizeFileName(String(payload.artifact_name)));
-    await env.EXECUTOR_RESULTS.put(key, bytes, {
-      httpMetadata: { contentType: "application/octet-stream" },
-    });
-    state.artifact_key = key;
-  }
-
-  await env.EXECUTOR_KV.put(taskStateKey(taskId), JSON.stringify(state));
-  return json({ ok: true, state });
-}
-
-function normalizeTaskSpec(payload) {
-  const task = {
-    id: String(payload.id || "").trim(),
-    type: String(payload.type || "script").trim(),
-    lang: String(payload.lang || "").trim(),
-    filename: String(payload.filename || "").trim(),
-    content: String(payload.content || ""),
-    cwd: String(payload.cwd || "").trim(),
-    timeout_sec: Number(payload.timeout_sec || 300),
-    created_at: String(payload.created_at || "").trim(),
-  };
-
-  if (!task.id) {
-    throw new Error("task id is required");
-  }
-  if (!task.lang) {
-    throw new Error("task lang is required");
-  }
-  if (!task.filename) {
-    throw new Error("task filename is required");
-  }
-  if (!task.content) {
-    throw new Error("task content is required");
-  }
-  return task;
-}
-
-async function readQueue(env) {
-  const raw = await env.EXECUTOR_KV.get(QUEUE_KEY);
-  if (!raw) {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.map((x) => String(x)) : [];
-  } catch {
-    return [];
-  }
-}
-
-async function writeQueue(env, queue) {
-  await env.EXECUTOR_KV.put(QUEUE_KEY, JSON.stringify(queue));
-}
-
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body, null, 2), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
+    artifact: {
+      channel,
+      key,
+      file_name: fileName,
+      content_type: contentType,
+      size: archiveBytes.byteLength,
+      sha256: digestHex,
+      uploaded_at: uploadedAt,
+      received_at: new Date().toISOString(),
+      expires_at: expiresAt,
+      download_url: await buildSignedDownloadUrl(request, env, key, expiresAt),
     },
   });
+}
+
+async function getArtifactObject(url, env) {
+  const key = String(url.searchParams.get("key") || "").trim();
+  if (!key.startsWith("artifacts/")) {
+    return json({ ok: false, error: "invalid_key" }, 400);
+  }
+
+  const object = await env.EXECUTOR_RESULTS.get(key);
+  if (!object) {
+    return json({ ok: false, error: "object_not_found" }, 404);
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "private, max-age=60");
+  headers.set("content-disposition", `attachment; filename="${key.split("/").pop()}"`);
+
+  return new Response(object.body, {
+    status: 200,
+    headers,
+  });
+}
+
+async function hasValidSignedDownload(url, env) {
+  const key = String(url.searchParams.get("key") || "").trim();
+  const exp = String(url.searchParams.get("exp") || "").trim();
+  const sig = String(url.searchParams.get("sig") || "").trim().toLowerCase();
+  if (!key || !exp || !sig) {
+    return false;
+  }
+
+  const expSec = Number(exp);
+  if (!Number.isFinite(expSec)) {
+    return false;
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (nowSec > expSec) {
+    return false;
+  }
+
+  const expected = await signDownload(env, key, exp);
+  return timingSafeEqual(sig, expected);
+}
+
+function buildObjectKey(host, service, uploadedAt, archiveName) {
+  const ts = new Date(uploadedAt);
+  const yyyy = String(ts.getUTCFullYear()).padStart(4, "0");
+  const mm = String(ts.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(ts.getUTCDate()).padStart(2, "0");
+  const hh = String(ts.getUTCHours()).padStart(2, "0");
+  const safeTs = uploadedAt.replace(/[:]/g, "-").replace(/[.]/g, "_");
+  return `logs/${host}/${service}/${yyyy}/${mm}/${dd}/${hh}/${safeTs}_${archiveName}`;
+}
+
+function buildArtifactKey(channel, uploadedAt, fileName) {
+  const ts = new Date(uploadedAt);
+  const yyyy = String(ts.getUTCFullYear()).padStart(4, "0");
+  const mm = String(ts.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(ts.getUTCDate()).padStart(2, "0");
+  const hh = String(ts.getUTCHours()).padStart(2, "0");
+  const safeTs = uploadedAt.replace(/[:]/g, "-").replace(/[.]/g, "_");
+  const nonce = crypto.randomUUID();
+  return `artifacts/${channel}/${yyyy}/${mm}/${dd}/${hh}/${safeTs}_${nonce}_${fileName}`;
+}
+
+function latestIndexKey(host, service) {
+  return `log-index:${host}:${service}:latest`;
+}
+
+function recentIndexKey(host, service) {
+  return `log-index:${host}:${service}:recent`;
+}
+
+function pointIndexKey(host, service, uploadedAt) {
+  return `log-index:${host}:${service}:${uploadedAt}`;
+}
+
+async function readJson(kv, key, fallback) {
+  const raw = await kv.get(key);
+  if (!raw) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeName(value, label) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!normalized) {
+    throw new Error(`${label} is required`);
+  }
+  return normalized;
+}
+
+function normalizeTimestamp(value) {
+  const raw = String(value || "").trim();
+  const timestamp = raw || new Date().toISOString();
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error("timestamp must be a valid ISO-8601 string");
+  }
+  return parsed.toISOString();
+}
+
+function normalizeSummary(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value;
+}
+
+function decodeBase64Field(value, label) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    throw new Error(`${label} is required`);
+  }
+  return Uint8Array.from(atob(raw), (char) => char.charCodeAt(0));
 }
 
 function sanitizeFileName(value) {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function toNullableNumber(value) {
-  if (value === null || value === undefined || value === "") {
-    return null;
+function clampInt(raw, fallback, min, max) {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
   }
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+  return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const view = new Uint8Array(digest);
+  return Array.from(view, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function signDownload(env, key, exp) {
+  const secret = (env.EXECUTOR_TOKEN || "").trim();
+  if (!secret) {
+    throw new Error("EXECUTOR_TOKEN is required for signed downloads");
+  }
+  const payload = encoder.encode(`${key}\n${exp}\n${secret}`);
+  return await sha256Hex(payload);
+}
+
+async function buildSignedDownloadUrl(request, env, key, expiresAtIso) {
+  const exp = String(Math.floor(new Date(expiresAtIso).getTime() / 1000));
+  const sig = await signDownload(env, key, exp);
+  const base = new URL(request.url);
+  const objectPath = key.startsWith("artifacts/") ? "/artifacts/object" : "/logs/object";
+  const signed = new URL(objectPath, base.origin);
+  signed.searchParams.set("key", key);
+  signed.searchParams.set("exp", exp);
+  signed.searchParams.set("sig", sig);
+  return signed.toString();
+}
+
+function buildExpiresAt(ttlSec) {
+  return new Date(Date.now() + ttlSec * 1000).toISOString();
+}
+
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+const encoder = new TextEncoder();
+
+function json(body, status = 200) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
 }
