@@ -3,6 +3,7 @@ param(
     [string]$RunDir = (Join-Path $HOME "g-claw"),
     [string]$WorkerUrl = "https://remote-executor.io99.xyz",
     [string]$HostName = $env:COMPUTERNAME,
+    [string]$Branch = "",
     [string]$TokenFile = (Join-Path $HOME ".glaw-log-observer-token.txt"),
     [string]$ResultPath = (Join-Path (Get-Location) "install-remote-log-uploader-result.txt"),
     [switch]$SkipGitPull
@@ -36,9 +37,24 @@ Require-Path -Path $TokenFile -Label "token file"
 if (-not $SkipGitPull) {
     Push-Location $RepoDir
     try {
-        & git pull
-        if ($LASTEXITCODE -ne 0) {
-            throw "git pull failed with exit code $LASTEXITCODE"
+        if ([string]::IsNullOrWhiteSpace($Branch)) {
+            & git pull
+            if ($LASTEXITCODE -ne 0) {
+                throw "git pull failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            & git fetch origin $Branch
+            if ($LASTEXITCODE -ne 0) {
+                throw "git fetch origin $Branch failed with exit code $LASTEXITCODE"
+            }
+            & git checkout -B $Branch "origin/$Branch"
+            if ($LASTEXITCODE -ne 0) {
+                throw "git checkout -B $Branch origin/$Branch failed with exit code $LASTEXITCODE"
+            }
+            & git pull origin $Branch
+            if ($LASTEXITCODE -ne 0) {
+                throw "git pull origin $Branch failed with exit code $LASTEXITCODE"
+            }
         }
     } finally {
         Pop-Location
@@ -85,6 +101,7 @@ $result = @(
     "TargetUploadScript: $TargetUploadScript",
     "WorkerUrl: $WorkerUrl",
     "HostName: $($HostName.ToLower())",
+    "Branch: $Branch",
     "SkipGitPull: $SkipGitPull",
     "",
     "== cron.json ==",
