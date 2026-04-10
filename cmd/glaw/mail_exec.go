@@ -234,13 +234,13 @@ func selectExecutableAttachment(savedNames []string) (string, []string, error) {
 	}
 
 	var scriptPath string
-	var attachmentPaths []string
+	var resourceAttachmentPaths []string
 	for _, savedName := range savedNames {
 		fullPath := filepath.Join(gatewaypkg.MediaDir, savedName)
-		attachmentPaths = append(attachmentPaths, fullPath)
 
 		ext := strings.ToLower(filepath.Ext(fullPath))
 		if ext != ".ps1" && ext != ".py" {
+			resourceAttachmentPaths = append(resourceAttachmentPaths, fullPath)
 			continue
 		}
 		if scriptPath != "" {
@@ -251,7 +251,7 @@ func selectExecutableAttachment(savedNames []string) (string, []string, error) {
 	if scriptPath == "" {
 		return "", nil, fmt.Errorf("expected exactly 1 executable attachment, got 0")
 	}
-	return scriptPath, attachmentPaths, nil
+	return scriptPath, resourceAttachmentPaths, nil
 }
 
 func copyFile(srcPath, dstPath string) error {
@@ -262,7 +262,7 @@ func copyFile(srcPath, dstPath string) error {
 	return os.WriteFile(dstPath, data, 0644)
 }
 
-func executeMailAttachment(scriptPath string, attachmentPaths []string) (string, string, error) {
+func executeMailAttachment(scriptPath string, resourceAttachmentPaths []string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), mailExecTimeout)
 	defer cancel()
 
@@ -270,11 +270,11 @@ func executeMailAttachment(scriptPath string, attachmentPaths []string) (string,
 	runner := ""
 	switch strings.ToLower(filepath.Ext(scriptPath)) {
 	case ".ps1":
-		args := append([]string{"-File", scriptPath}, attachmentPaths...)
+		args := append([]string{"-File", scriptPath}, resourceAttachmentPaths...)
 		cmd = exec.CommandContext(ctx, "pwsh", args...)
 		runner = "pwsh"
 	case ".py":
-		args := append([]string{scriptPath}, attachmentPaths...)
+		args := append([]string{scriptPath}, resourceAttachmentPaths...)
 		cmd = exec.CommandContext(ctx, "python", args...)
 		runner = "python"
 	default:
@@ -282,7 +282,7 @@ func executeMailAttachment(scriptPath string, attachmentPaths []string) (string,
 	}
 
 	cmd.Dir = filepath.Dir(scriptPath)
-	log.Printf("[mail_exec] [*] Executing attachment via %s: %s attachments=%v", runner, scriptPath, attachmentPaths)
+	log.Printf("[mail_exec] [*] Executing attachment via %s: %s resource_attachments=%v", runner, scriptPath, resourceAttachmentPaths)
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -388,7 +388,7 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 	stdout := ""
 	stderr := ""
 
-	scriptPath, attachmentPaths, err := selectExecutableAttachment(archivedEmail.Attachments)
+	scriptPath, resourceAttachmentPaths, err := selectExecutableAttachment(archivedEmail.Attachments)
 	if err != nil {
 		log.Printf("[mail_exec] [!] Attachment selection failed for uid=%d: %v", uid, err)
 		stderr = err.Error() + "\n"
@@ -400,7 +400,7 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 			stderr = err.Error() + "\n"
 		} else {
 			log.Printf("[mail_exec] [*] Copied attachment for uid=%d to: %s", uid, tempScriptPath)
-			stdout, stderr, err = executeMailAttachment(tempScriptPath, attachmentPaths)
+			stdout, stderr, err = executeMailAttachment(tempScriptPath, resourceAttachmentPaths)
 		}
 		if err != nil {
 			if strings.TrimSpace(stderr) == "" {

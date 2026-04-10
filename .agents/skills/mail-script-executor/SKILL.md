@@ -38,14 +38,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 ## Script
 
-Use `mail-script-executor/scripts/send_and_check_reply.py` for the common send -> sleep -> latest-reply loop:
+Prefer one serial shell command for send + latest-reply polling instead of a wrapper helper:
 
-```bash
-python mail-script-executor/scripts/send_and_check_reply.py \
-  --to trusted-recipient@example.com \
-  --subject "claw-life-saver probe git clean" \
-  --body-file C:\path\to\gateway\outbox\mail.md \
-  --attachment C:\path\to\script.py \
-  --reply-sender trusted-recipient@example.com \
-  --repo C:\path\to\glaw
+```powershell
+python C:\path\to\send_email.py --to trusted-recipient@example.com --subject "claw-life-saver probe git clean" --markdown-body-file C:\path\to\gateway\outbox\mail.md --attachments C:\path\to\script.py; go run .\cmd\glaw mail latest --sender trusted-recipient@example.com --max-sleep-seconds 60 --poll-interval-seconds 2
 ```

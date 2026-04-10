@@ -24,6 +24,9 @@ UPGRADE_DIR = RUN_DIR / "upgrade"
 BUILT_EXE_PATH = UPGRADE_DIR / "claw-life-saver.next.exe"
 START_SCRIPT_PATH = RUN_DIR / "start-claw-life-saver.py"
 EXEC_SCRIPT_PATH = UPGRADE_DIR / "finalize-detached.py"
+EXEC_STDOUT_PATH = UPGRADE_DIR / "finalize-detached.stdout.txt"
+EXEC_STDERR_PATH = UPGRADE_DIR / "finalize-detached.stderr.txt"
+TARGET_PROCESS_NAME = "claw-life-saver.exe"
 
 
 def write_log(message: str) -> None:
@@ -98,6 +101,7 @@ def build_exec_script() -> str:
         RUN_DIR = Path(r"{RUN_DIR}")
         START_SCRIPT_PATH = Path(r"{START_SCRIPT_PATH}")
         UPGRADE_LOG_PATH = Path(r"{UPGRADE_LOG_PATH}")
+        TARGET_PROCESS_NAME = "{TARGET_PROCESS_NAME}"
 
         def write_log(message: str) -> None:
             line = f"[{{time.strftime('%Y-%m-%dT%H:%M:%S%z')}}] {{message}}"
@@ -106,17 +110,20 @@ def build_exec_script() -> str:
             with UPGRADE_LOG_PATH.open("a", encoding="utf-8") as f:
                 f.write(line + "\\n")
 
+        write_log("Detached finalize stage starting after grace sleep")
+        time.sleep(5)
+
         result = subprocess.run(
             [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                "(Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -eq '{DEST_EXE_PATH}' }} | Select-Object -ExpandProperty ProcessId) -join '\\n'",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+                "(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq '" + TARGET_PROCESS_NAME + "' }} | Select-Object -ExpandProperty ProcessId) -join '\\n'",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             check=False,
         )
         pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -132,11 +139,11 @@ def build_exec_script() -> str:
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                "(Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -eq '{DEST_EXE_PATH}' }} | Select-Object ProcessId, CommandLine | Format-List | Out-String)",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
+                "(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq '" + TARGET_PROCESS_NAME + "' }} | Select-Object ProcessId, CommandLine | Format-List | Out-String)",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
             errors="replace",
             check=False,
         )
@@ -181,11 +188,14 @@ def main() -> int:
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-    subprocess.Popen(
-        ["python", str(EXEC_SCRIPT_PATH)],
-        cwd=str(RUN_DIR),
-        creationflags=creationflags,
-    )
+    with EXEC_STDOUT_PATH.open("wb") as exec_stdout, EXEC_STDERR_PATH.open("wb") as exec_stderr:
+        subprocess.Popen(
+            ["python", str(EXEC_SCRIPT_PATH)],
+            cwd=str(RUN_DIR),
+            creationflags=creationflags,
+            stdout=exec_stdout,
+            stderr=exec_stderr,
+        )
     write_log("Launched detached finalize stage")
     print(str(BUILT_EXE_PATH))
     return 0
