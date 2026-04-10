@@ -82,8 +82,8 @@ go build -buildvcs=false -o ~/bin/glaw.exe ./cmd/glaw
 
 ## Cron / 定时任务
 
-`serve` watches `cron.json` by default. If the file does not exist, the scheduler stays idle.  
-`serve` 默认会监听 `cron.json`；如果文件不存在，scheduler 会保持空闲。
+`serve` watches `~/.glaw/cron.json` by default. If the file does not exist, the scheduler stays idle.  
+`serve` 默认会监听 `~/.glaw/cron.json`；如果文件不存在，scheduler 会保持空闲。
 
 Supported schedules / 支持的调度:
 

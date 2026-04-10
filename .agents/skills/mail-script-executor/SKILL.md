@@ -15,7 +15,7 @@ Current convention:
 ## Rules
 
 1. One mail, one executable attachment.
-2. Prefer `.py` when the script prints structured text or Chinese output.
+2. Default to `.py` for execution-chain scripts. Use `.ps1` only when Python is genuinely unsuitable for the task.
 3. Every mailed `.py` should include:
 
 ```python

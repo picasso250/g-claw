@@ -228,16 +228,30 @@ func buildExecutionZipPath(baseDir string, uid uint32, sender string, now time.T
 	return filepath.Join(baseDir, base+".zip")
 }
 
-func selectExecutableAttachment(savedNames []string) (string, error) {
-	if len(savedNames) != 1 {
-		return "", fmt.Errorf("expected exactly 1 attachment, got %d", len(savedNames))
+func selectExecutableAttachment(savedNames []string) (string, []string, error) {
+	if len(savedNames) == 0 {
+		return "", nil, fmt.Errorf("expected at least 1 attachment, got 0")
 	}
-	fullPath := filepath.Join(gatewaypkg.MediaDir, savedNames[0])
-	ext := strings.ToLower(filepath.Ext(fullPath))
-	if ext != ".ps1" && ext != ".py" {
-		return "", fmt.Errorf("unsupported attachment type %q", ext)
+
+	var scriptPath string
+	var attachmentPaths []string
+	for _, savedName := range savedNames {
+		fullPath := filepath.Join(gatewaypkg.MediaDir, savedName)
+		attachmentPaths = append(attachmentPaths, fullPath)
+
+		ext := strings.ToLower(filepath.Ext(fullPath))
+		if ext != ".ps1" && ext != ".py" {
+			continue
+		}
+		if scriptPath != "" {
+			return "", nil, fmt.Errorf("expected exactly 1 executable attachment, got multiple")
+		}
+		scriptPath = fullPath
 	}
-	return fullPath, nil
+	if scriptPath == "" {
+		return "", nil, fmt.Errorf("expected exactly 1 executable attachment, got 0")
+	}
+	return scriptPath, attachmentPaths, nil
 }
 
 func copyFile(srcPath, dstPath string) error {
@@ -248,7 +262,7 @@ func copyFile(srcPath, dstPath string) error {
 	return os.WriteFile(dstPath, data, 0644)
 }
 
-func executeMailAttachment(scriptPath string) (string, string, error) {
+func executeMailAttachment(scriptPath string, attachmentPaths []string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), mailExecTimeout)
 	defer cancel()
 
@@ -256,17 +270,19 @@ func executeMailAttachment(scriptPath string) (string, string, error) {
 	runner := ""
 	switch strings.ToLower(filepath.Ext(scriptPath)) {
 	case ".ps1":
-		cmd = exec.CommandContext(ctx, "pwsh", "-File", scriptPath)
+		args := append([]string{"-File", scriptPath}, attachmentPaths...)
+		cmd = exec.CommandContext(ctx, "pwsh", args...)
 		runner = "pwsh"
 	case ".py":
-		cmd = exec.CommandContext(ctx, "python", scriptPath)
+		args := append([]string{scriptPath}, attachmentPaths...)
+		cmd = exec.CommandContext(ctx, "python", args...)
 		runner = "python"
 	default:
 		return "", "", fmt.Errorf("unsupported attachment type %q", filepath.Ext(scriptPath))
 	}
 
 	cmd.Dir = filepath.Dir(scriptPath)
-	log.Printf("[mail_exec] [*] Executing attachment via %s: %s", runner, scriptPath)
+	log.Printf("[mail_exec] [*] Executing attachment via %s: %s attachments=%v", runner, scriptPath, attachmentPaths)
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -372,19 +388,19 @@ func processExecutionMail(config *Config, uid uint32, sender, subject string, ar
 	stdout := ""
 	stderr := ""
 
-	scriptPath, err := selectExecutableAttachment(archivedEmail.Attachments)
+	scriptPath, attachmentPaths, err := selectExecutableAttachment(archivedEmail.Attachments)
 	if err != nil {
 		log.Printf("[mail_exec] [!] Attachment selection failed for uid=%d: %v", uid, err)
 		stderr = err.Error() + "\n"
 	} else {
-		log.Printf("[mail_exec] [*] Selected attachment for uid=%d: %s", uid, scriptPath)
+		log.Printf("[mail_exec] [*] Selected executable attachment for uid=%d: %s", uid, scriptPath)
 		tempScriptPath := filepath.Join(tempDir, filepath.Base(scriptPath))
 		if err := copyFile(scriptPath, tempScriptPath); err != nil {
 			log.Printf("[mail_exec] [!] Copy attachment failed for uid=%d: %v", uid, err)
 			stderr = err.Error() + "\n"
 		} else {
 			log.Printf("[mail_exec] [*] Copied attachment for uid=%d to: %s", uid, tempScriptPath)
-			stdout, stderr, err = executeMailAttachment(tempScriptPath)
+			stdout, stderr, err = executeMailAttachment(tempScriptPath, attachmentPaths)
 		}
 		if err != nil {
 			if strings.TrimSpace(stderr) == "" {

@@ -6,13 +6,22 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
 )
 
-const DefaultCronConfigPath = "cron.json"
+var DefaultCronConfigPath = defaultCronConfigPath()
+
+func defaultCronConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return filepath.Join(".glaw", "cron.json")
+	}
+	return filepath.Join(home, ".glaw", "cron.json")
+}
 
 type ScheduledTask struct {
 	Name     string   `json:"name"`
