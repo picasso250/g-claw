@@ -6,9 +6,9 @@ import zipfile
 from pathlib import Path
 
 
-def git_hash4(repo_root: Path) -> str:
+def git_short_hash(repo_root: Path) -> str:
     result = subprocess.run(
-        ["git", "rev-parse", "--short=4", "HEAD"],
+        ["git", "rev-parse", "--short", "HEAD"],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -17,9 +17,9 @@ def git_hash4(repo_root: Path) -> str:
         check=True,
     )
     value = result.stdout.strip()
-    if len(value) < 4:
-        raise SystemExit(f"unexpected short hash: {value!r}")
-    return value[:4]
+    if not value:
+        raise SystemExit("unexpected empty short hash")
+    return value
 
 
 def tracked_files(repo_root: Path) -> list[Path]:
@@ -49,17 +49,17 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default="dist/mail-upgrade",
-        help="output zip path or output directory; default writes into dist/mail-upgrade with hash in filename",
+        help="output zip path or output directory; default writes into dist/mail-upgrade with default short-hash in filename",
     )
     args = parser.parse_args()
 
     repo_root = Path(args.repo).resolve()
-    hash4 = git_hash4(repo_root)
+    short_hash = git_short_hash(repo_root)
     requested_output = Path(args.output)
     if requested_output.suffix.lower() == ".zip":
         output_path = requested_output.resolve()
     else:
-        output_path = (requested_output / f"claw-life-saver-source-{hash4}.zip").resolve()
+        output_path = (requested_output / f"claw-life-saver-source-{short_hash}.zip").resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     files = tracked_files(repo_root)
@@ -71,7 +71,7 @@ def main() -> int:
             zf.write(path, arcname=path.relative_to(repo_root).as_posix())
 
     print(f"repo={repo_root}")
-    print(f"hash4={hash4}")
+    print(f"short_hash={short_hash}")
     print(f"output={output_path}")
     print(f"files={len(files)}")
     for path in files:

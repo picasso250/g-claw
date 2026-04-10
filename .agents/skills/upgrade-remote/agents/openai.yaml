@@ -1,0 +1,4 @@
+interface:
+  display_name: "Upgrade Remote"
+  short_description: "Two-stage remote upgrade workflow"
+  default_prompt: "Use $upgrade-remote to prepare, finalize, and verify a remote upgrade by email."
