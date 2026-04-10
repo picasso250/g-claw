@@ -228,6 +228,14 @@ func buildExecutionZipPath(baseDir string, uid uint32, sender string, now time.T
 	return filepath.Join(baseDir, base+".zip")
 }
 
+func absPath(path string) (string, error) {
+	resolved, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
 func selectExecutableAttachment(savedNames []string) (string, []string, error) {
 	if len(savedNames) == 0 {
 		return "", nil, fmt.Errorf("expected at least 1 attachment, got 0")
@@ -236,7 +244,10 @@ func selectExecutableAttachment(savedNames []string) (string, []string, error) {
 	var scriptPath string
 	var resourceAttachmentPaths []string
 	for _, savedName := range savedNames {
-		fullPath := filepath.Join(gatewaypkg.MediaDir, savedName)
+		fullPath, err := absPath(filepath.Join(gatewaypkg.MediaDir, savedName))
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve attachment path %q: %w", savedName, err)
+		}
 
 		ext := strings.ToLower(filepath.Ext(fullPath))
 		if ext != ".ps1" && ext != ".py" {
