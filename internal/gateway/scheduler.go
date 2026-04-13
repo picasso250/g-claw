@@ -37,6 +37,7 @@ type ScheduledTask struct {
 
 type Scheduler struct {
 	configPath string
+	statePath  string
 	dispatchCh chan<- DispatchRequest
 	lastRun    map[string]string
 }
@@ -48,12 +49,16 @@ func NewScheduler(configPath string, dispatchCh chan<- DispatchRequest) *Schedul
 	}
 	return &Scheduler{
 		configPath: configPath,
+		statePath:  schedulerStatePath(configPath),
 		dispatchCh: dispatchCh,
 		lastRun:    make(map[string]string),
 	}
 }
 
 func (s *Scheduler) Run(stopChan <-chan bool) {
+	if err := s.loadState(); err != nil && !os.IsNotExist(err) {
+		log.Printf("[scheduler] [!] Load state %s failed: %v", s.statePath, err)
+	}
 	log.Printf("[scheduler] [*] Watching %s", s.configPath)
 	s.runDueTasks(time.Now())
 
@@ -105,6 +110,9 @@ func (s *Scheduler) runDueTasks(now time.Time) {
 			continue
 		}
 		s.lastRun[taskKey] = slot
+		if err := s.saveState(); err != nil {
+			log.Printf("[scheduler] [!] Save state %s failed: %v", s.statePath, err)
+		}
 	}
 }
 
@@ -192,17 +200,16 @@ func (t ScheduledTask) runSlot(now time.Time) (string, bool, error) {
 		}
 		return now.Format("2006-01-02T15"), true, nil
 	case "daily":
-		if now.Minute() != 0 {
-			return "", false, nil
-		}
 		hours, err := t.validatedHours()
 		if err != nil {
 			return "", false, err
 		}
-		if !slices.Contains(hours, now.Hour()) {
+		slotHour, ok := latestDailySlotHour(hours, now.Hour())
+		if !ok {
 			return "", false, nil
 		}
-		return now.Format("2006-01-02T15"), true, nil
+		slot := time.Date(now.Year(), now.Month(), now.Day(), slotHour, 0, 0, 0, now.Location())
+		return slot.Format("2006-01-02T15"), true, nil
 	default:
 		return "", false, fmt.Errorf("unsupported schedule %q", t.Schedule)
 	}
@@ -231,6 +238,66 @@ func (t ScheduledTask) validatedHours() ([]int, error) {
 	}
 	slices.Sort(hours)
 	return hours, nil
+}
+
+func latestDailySlotHour(hours []int, nowHour int) (int, bool) {
+	for i := len(hours) - 1; i >= 0; i-- {
+		if hours[i] <= nowHour {
+			return hours[i], true
+		}
+	}
+	return 0, false
+}
+
+type schedulerState struct {
+	LastRun map[string]string `json:"last_run"`
+}
+
+func schedulerStatePath(configPath string) string {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		configPath = DefaultCronConfigPath
+	}
+
+	dir := filepath.Dir(configPath)
+	base := filepath.Base(configPath)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if name == "" {
+		name = "cron"
+	}
+	return filepath.Join(dir, name+".state.json")
+}
+
+func (s *Scheduler) loadState() error {
+	data, err := os.ReadFile(s.statePath)
+	if err != nil {
+		return err
+	}
+
+	var state schedulerState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+	if state.LastRun == nil {
+		state.LastRun = make(map[string]string)
+	}
+	s.lastRun = state.LastRun
+	return nil
+}
+
+func (s *Scheduler) saveState() error {
+	state := schedulerState{LastRun: s.lastRun}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	if err := os.MkdirAll(filepath.Dir(s.statePath), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.statePath, data, 0644)
 }
 
 func (s *Scheduler) executeTask(task ScheduledTask, index int) error {

@@ -90,6 +90,9 @@ Supported schedules / 支持的调度:
 - `hourly`
 - `daily`
 
+For `daily`, if `glaw serve` starts after a configured hour and that slot has not run yet today, the scheduler will catch it up once instead of skipping the rest of the day.  
+对于 `daily`，如果 `glaw serve` 在某个配置小时之后才启动，而且当天该时段还没跑过，scheduler 会补跑一次，而不是整天直接跳过。
+
 Supported task types / 支持的任务类型:
 
 - `program` or empty `type`
